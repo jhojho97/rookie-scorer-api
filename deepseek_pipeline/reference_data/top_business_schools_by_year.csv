@@ -1,0 +1,201 @@
+year,rank,university
+2015,1,Harvard University
+2015,1,Stanford University
+2015,1,University of Pennsylvania
+2015,4,University of Chicago
+2015,5,Massachusetts Institute of Technology
+2015,6,Northwestern University
+2015,7,University of California-Berkeley
+2015,8,Columbia University
+2015,9,Dartmouth College
+2015,10,New York University
+2015,11,University of Michigan-Ann Arbor
+2015,11,University of Virginia
+2015,13,Yale University
+2015,14,Duke University
+2015,15,University of Texas-Austin
+2015,16,University of California-Los Angeles
+2015,17,Cornell University
+2015,18,Caregie Mellon University
+2015,19,University of North Carolina-Chapel Hill
+2015,20,Emory University
+2015,21,Indiana University-Bloomington
+2015,22,Washington University in St. Louis
+2015,23,Georgetown Universlty
+2015,23,University of Notre Dame
+2015,25,University of Washington
+2015,25,Vanderbilt University
+2015,27,Arizona State University
+2015,27,Brigham Young University
+2015,27,Georgia Institute of Technology
+2015,27,Ohio State University
+2015,27,University of Southern California
+2015,27,University of Wisconsin
+2015,33,Rice University
+2015,33,University of Minnesota
+2015,35,Michigan State University
+2015,35,University of Illinois-Urbana-Champaign
+2015,37,Texas A&M University
+2015,37,University of Rochester
+2015,37,University of Texas-Dallas
+2015,40,Purdue University
+2015,41,Pennsyivania State University-University Park
+2015,41,University of California-Davis
+2015,41,University of Maryland
+2015,41,University of Florida
+2015,45,Boston College
+2015,45,Boston University
+2015,45,University of Califomia-lryine
+2015,48,Temple University
+2015,48,University of Arizona
+2015,48,University of Georgia
+2016,1,Stanford University
+2016,2,Harvard University
+2016,3,University of Pennsylvania
+2016,4,University of Chicago
+2016,5,Massachusetts Institute of Technology
+2016,6,Northwestern University
+2016,7,University of California-Berkeley
+2016,8,Columbia University
+2016,9,Dartmouth College
+2016,10,University of Virginia
+2016,11,New York University
+2016,11,University of Michigan-Ann Arbor
+2016,13,Duke University
+2016,13,Yale University
+2016,15,University of California-Los Angeles
+2016,16,Cornell University
+2016,17,University of Texas-Austin
+2016,18,University of North Carolina - chapel Hill
+2016,19,Washington University in St. Louis
+2016,20,Carnegie Mellon University
+2016,21,Emory University
+2016,21,Indiana University
+2016,23,University of Washington
+2016,24,Georgetown University
+2016,25,University of Notre Dame
+2016,25,University of Southern California
+2016,27,Texas A&M University
+2016,27,University of Minnesota
+2016,27,Vanderbilt University
+2016,30,Arizona State University
+2016,30,Georgia Institute of Technology
+2016,30,Ohio State University
+2016,33,Brigham Young University
+2016,33,Rice University
+2016,33,University of Texas-Dallas
+2016,33,University of Wisconsin
+2016,37,Michigan State University
+2016,37,Pennsylvania State University
+2016,37,University of Florida
+2016,37,University of Rochester
+2016,41,Temple University
+2016,41,University of Maryland
+2016,43,Boston University
+2016,43,University of lowa
+2016,45,Boston College
+2016,45,Wake Forest University
+2016,47,University of Illinois-Urbana-Champaign
+2016,48,"Rutgers, The State University of New Jersey"
+2016,48,Southern Methodist University
+2016,48,University of California-Davis
+2017,1,Harvard University
+2017,2,Stanford University
+2017,2,University of Chicago
+2017,4,University of Pennsylvania
+2017,5,Massachusetts Institute of Technology
+2017,5,Northwestern University
+2017,7,University of California-Berkeley
+2017,8,Dartmouth College
+2017,8,Yale University
+2017,10,Columbia University
+2017,11,University of Virginia
+2017,12,Duke University
+2017,12,University of Michigan-Ann Arbor
+2017,14,Cornell University
+2017,15,University of California-Los Angeles
+2017,16,University of North Carolina-Chapel Hill
+2017,16,University of Texas-Austin
+2017,18,Carnegie Mellon University
+2017,19,Emory University
+2017,20,New York University
+2017,21,Washington University in St. Louis
+2017,22,Georgetown University
+2017,22,Indiana University
+2017,22,Vanderbilt University
+2017,25,Rice University
+2017,25,University of Notre Dame
+2017,27,Ohio State University
+2017,27,University of Minnesota
+2017,27,University of Washington
+2017,27,University of Wisconsin Madison
+2017,31,Brigham Young University
+2017,31,Texas A&M University
+2017,31,University of Southem Califonia
+2017,34,Georgia Institute of Technology
+2017,35,Arizona State University
+2017,35,Michigan State University
+2017,37,University of Florida
+2017,37,University of Texas-Dallas
+2017,39,University of Illinois-Urana-Champaign
+2017,39,University of Rochester
+2017,41,Boston University
+2017,41,Pennsylvania State University
+2017,41,Temple University
+2017,41,University of Maryland
+2017,45,University of Califonia-Davis
+2017,45,University of lowa
+2017,47,Purdue University
+2017,48,Southem Methodist University
+2017,48,University of California-lrvine
+2017,50,Boston College
+2018,1,Harvard University
+2018,1,University of Pennsyivania
+2018,3,University of Chicago
+2018,4,Massachusetts Institute of Technology
+2018,4,Northwestern University
+2018,4,Stanford University
+2018,7,University of California at Berkeley
+2018,8,Dartmouth College
+2018,9,Columbia University
+2018,9,Yale University
+2018,11,University of Michigan
+2018,12,Duke University
+2018,12,New York University
+2018,14,University of Virginia
+2018,15,University of California at Los Angeles
+2018,16,Cornell University
+2018,17,University of Texas-Austin
+2018,18,University of North Carolina Chapel Hill
+2018,19,Carnegie Mellon University
+2018,20,Emory University
+2018,21,Georgetown University
+2018,21,Indiana University
+2018,21,Washington University
+2018,24,University of Soutern California
+2018,25,Arizona State University
+2018,25,Vanderbilt University
+2018,27,Ohio State University
+2018,27,University of Washington
+2018,29,Georgia Institute of Technology
+2018,29,Rice University
+2018,29,University of Notre Dame
+2018,32,Temple University
+2018,32,University of Minnesota
+2018,34,Brigham Young University
+2018,34,University of Wisconsin
+2018,36,Pennsylvania State University
+2018,37,Michigan State University
+2018,38,Texas A&M University
+2018,38,University of Texas-Dallas
+2018,40,University of Florida
+2018,40,University of Illinois-Urbana-Champaign
+2018,42,University of Califomia Davis
+2018,43,University of Rochester
+2018,44,Boston College
+2018,44,Boston University
+2018,44,Universiy of California at Irvine
+2018,47,Universiy of Maryland
+2018,48,Uniwersity of Georgia
+2018,49,University of Arizona
+2018,50,Purdue University

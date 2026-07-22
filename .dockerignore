@@ -1,0 +1,12 @@
+# Keep the image lean and reproducible.
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitattributes
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+# Generated at runtime; never ship stale artifacts.
+deepseek_pipeline/webapp/shap_output/
