@@ -31,8 +31,8 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from fastapi import (FastAPI, UploadFile, File, HTTPException, BackgroundTasks,
-                     Depends, Header)
+from fastapi import (FastAPI, UploadFile, File, Form, HTTPException,
+                     BackgroundTasks, Depends, Header)
 from fastapi.middleware.cors import CORSMiddleware
 
 HERE = Path(__file__).resolve().parent
@@ -124,9 +124,31 @@ async def predict(cv: UploadFile = File(...),
         raise HTTPException(500, f"Scoring failed: {e}")
 
 
-# --- Batch: a zip of candidate subfolders (each with a CV/JMP) ---------------
-def _run_batch(job_id: str, zip_bytes: bytes, top_n: int):
+# --- Batch: shared scoring loop ----------------------------------------------
+def _score_job(job_id: str, candidates: list[dict], top_n: int):
+    """Score a prepared list of candidates sequentially (one at a time, so peak
+    memory is independent of batch size). Each candidate is a dict with keys
+    name / cv_text / jmp_text. Results/progress are written into JOBS[job_id]."""
     job = JOBS[job_id]
+    try:
+        job["total"] = len(candidates)
+        for i, c in enumerate(candidates):
+            try:
+                res = SCORER.score(c["cv_text"], c["jmp_text"], top_n=top_n)
+                res["candidate"] = c["name"]
+                job["results"].append(res)
+            except Exception as e:
+                job["results"].append({"candidate": c["name"],
+                                       "status": "error", "reason": str(e)})
+            job["done"] = i + 1
+        job["status"] = "done"
+    except Exception as e:
+        job["status"] = "error"
+        job["reason"] = str(e)
+
+
+# --- Batch A: a zip of candidate subfolders (each with a CV/JMP) -------------
+def _run_batch(job_id: str, zip_bytes: bytes, top_n: int):
     try:
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
@@ -136,30 +158,26 @@ def _run_batch(job_id: str, zip_bytes: bytes, top_n: int):
             folders = [d for d in root.rglob("*") if d.is_dir()
                        and any(f.suffix.lower() in {".pdf", ".doc", ".docx"}
                                for f in d.iterdir() if f.is_file())]
-            job["total"] = len(folders)
-            for i, folder in enumerate(sorted(folders, key=lambda p: p.name.lower())):
-                try:
-                    cvf = find_cv_file(folder)
-                    jmf = find_jmp_file(folder, cv_file=cvf)
-                    cv_text = extract_text(cvf) if cvf else ""
-                    jfull = extract_text(jmf) if jmf else ""
-                    jmp_text = extract_jmp_sections(jfull) if jfull else ""
-                    res = SCORER.score(cv_text, jmp_text, top_n=top_n)
-                    res["candidate"] = folder.name
-                    job["results"].append(res)
-                except Exception as e:
-                    job["results"].append({"candidate": folder.name,
-                                           "status": "error", "reason": str(e)})
-                job["done"] = i + 1
-            job["status"] = "done"
+            candidates = []
+            for folder in sorted(folders, key=lambda p: p.name.lower()):
+                cvf = find_cv_file(folder)
+                jmf = find_jmp_file(folder, cv_file=cvf)
+                cv_text = extract_text(cvf) if cvf else ""
+                jfull = extract_text(jmf) if jmf else ""
+                jmp_text = extract_jmp_sections(jfull) if jfull else ""
+                candidates.append({"name": folder.name,
+                                   "cv_text": cv_text, "jmp_text": jmp_text})
+            _score_job(job_id, candidates, top_n)
     except Exception as e:
-        job["status"] = "error"
-        job["reason"] = str(e)
+        JOBS[job_id]["status"] = "error"
+        JOBS[job_id]["reason"] = str(e)
 
 
 @app.post("/predict/batch", dependencies=[Depends(require_key)])
 async def predict_batch(background: BackgroundTasks,
                         archive: UploadFile = File(...), top_n: int = 5):
+    """Batch from a .zip of candidate folders (each folder = one candidate with
+    a CV and optional JMP; CV/JMP identified by filename + size heuristics)."""
     if SCORER is None:
         raise HTTPException(503, "Model not ready.")
     data = await archive.read()
@@ -167,6 +185,44 @@ async def predict_batch(background: BackgroundTasks,
     JOBS[job_id] = {"status": "running", "done": 0, "total": None, "results": []}
     background.add_task(_run_batch, job_id, data, top_n)
     return {"job_id": job_id}
+
+
+# --- Batch B: loose files as explicit CV+JMP pairs ---------------------------
+@app.post("/predict/batch_files", dependencies=[Depends(require_key)])
+async def predict_batch_files(background: BackgroundTasks,
+                              cv: list[UploadFile] = File(...),
+                              jmp: list[UploadFile] = File(default=[]),
+                              name: list[str] = Form(default=[]),
+                              top_n: int = 5):
+    """Batch from loose files, paired by position: candidate i = cv[i] + jmp[i].
+    `jmp` is optional; if provided it must have the same length as `cv` (send a
+    0-byte file for a candidate that has no JMP). `name` optionally labels each
+    candidate (defaults to the CV filename stem). Text is extracted here (uploads
+    can't be read off-thread); scoring runs in the background -> returns job_id."""
+    if SCORER is None:
+        raise HTTPException(503, "Model not ready.")
+    if not cv:
+        raise HTTPException(422, "Provide at least one cv file.")
+    if jmp and len(jmp) != len(cv):
+        raise HTTPException(422, "If jmp files are provided, there must be exactly "
+                                 "one per cv, in the same order (use a 0-byte file "
+                                 "for a candidate without a JMP).")
+    candidates = []
+    for i, cvf in enumerate(cv):
+        cv_text = extract_upload(cvf.filename, await cvf.read())
+        jmp_text = ""
+        if jmp:
+            jbytes = await jmp[i].read()
+            if jbytes:                      # 0-byte placeholder => no JMP
+                jmp_text = _read_jmp(jmp[i].filename, jbytes)
+        label = (name[i] if i < len(name) and name[i].strip()
+                 else (Path(cvf.filename).stem if cvf.filename else f"candidate_{i+1}"))
+        candidates.append({"name": label, "cv_text": cv_text, "jmp_text": jmp_text})
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {"status": "running", "done": 0,
+                    "total": len(candidates), "results": []}
+    background.add_task(_score_job, job_id, candidates, top_n)
+    return {"job_id": job_id, "total": len(candidates)}
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_key)])
