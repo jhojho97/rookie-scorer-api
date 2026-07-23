@@ -18,9 +18,15 @@ import json
 import warnings
 
 # USD per 1,000,000 tokens: model -> (input_rate, output_rate).
-# As of 2026-07 — VERIFY before relying on these for real budgeting.
+# Verified via web 2026-07-23. Input uses the cache-MISS rate (conservative
+# over-estimate; DeepSeek cache hits are far cheaper). NOTE: the `deepseek-chat`
+# alias deprecates 2026/07/24 -> `deepseek-v4-flash` (same rates). Embedding kept
+# at the higher $0.13 quote (OpenAI lists both $0.13 and $0.065) so budgets never
+# under-count. Override any rate at runtime with ROOKIE_PRICES (JSON).
 _DEFAULT_PRICES = {
-    "deepseek-chat":          (0.27, 1.10),
+    "deepseek-chat":          (0.14, 0.28),
+    "deepseek-v4-flash":      (0.14, 0.28),
+    "deepseek-v4-pro":        (0.435, 0.87),
     "deepseek-reasoner":      (0.55, 2.19),
     "gpt-4o":                 (2.50, 10.00),
     "gpt-4o-mini":            (0.15, 0.60),
