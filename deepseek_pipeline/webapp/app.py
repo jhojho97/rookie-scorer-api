@@ -137,6 +137,8 @@ def _score_job(job_id: str, candidates: list[dict], top_n: int):
                 res = SCORER.score(c["cv_text"], c["jmp_text"], top_n=top_n)
                 res["candidate"] = c["name"]
                 job["results"].append(res)
+                job["cost_usd"] = round(
+                    job.get("cost_usd", 0.0) + (res.get("cost", {}) or {}).get("usd", 0.0), 6)
             except Exception as e:
                 job["results"].append({"candidate": c["name"],
                                        "status": "error", "reason": str(e)})
@@ -182,7 +184,8 @@ async def predict_batch(background: BackgroundTasks,
         raise HTTPException(503, "Model not ready.")
     data = await archive.read()
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"status": "running", "done": 0, "total": None, "results": []}
+    JOBS[job_id] = {"status": "running", "done": 0, "total": None,
+                    "results": [], "cost_usd": 0.0}
     background.add_task(_run_batch, job_id, data, top_n)
     return {"job_id": job_id}
 
@@ -220,7 +223,7 @@ async def predict_batch_files(background: BackgroundTasks,
         candidates.append({"name": label, "cv_text": cv_text, "jmp_text": jmp_text})
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {"status": "running", "done": 0,
-                    "total": len(candidates), "results": []}
+                    "total": len(candidates), "results": [], "cost_usd": 0.0}
     background.add_task(_score_job, job_id, candidates, top_n)
     return {"job_id": job_id, "total": len(candidates)}
 
@@ -233,4 +236,5 @@ def job_status(job_id: str):
     return {"status": job["status"],
             "progress": f"{job['done']}/{job['total']}" if job["total"] else "0/?",
             "results": job["results"],
+            "cost_usd": round(job.get("cost_usd", 0.0), 6),
             "reason": job.get("reason")}

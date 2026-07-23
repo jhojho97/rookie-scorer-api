@@ -53,7 +53,7 @@ def get_client():
     return OpenAI(api_key=key, base_url=DEEPSEEK_BASE_URL)
 
 
-def call_json(client, prompt, user_text="", model=None):
+def call_json(client, prompt, user_text="", model=None, meter=None):
     model = model or DEEPSEEK_MODEL
     content = ""
     last_err = None
@@ -66,6 +66,12 @@ def call_json(client, prompt, user_text="", model=None):
                 response_format={"type": "json_object"},
                 temperature=0.0, max_tokens=4096,
             )
+            # record token usage as soon as the call succeeds (tokens are spent
+            # even if JSON parsing below fails and we fall back to regex).
+            if meter is not None and getattr(resp, "usage", None) is not None:
+                u = resp.usage
+                meter.add("extraction", model,
+                          getattr(u, "prompt_tokens", 0), getattr(u, "completion_tokens", 0))
             content = resp.choices[0].message.content
             return json.loads(content)
         except json.JSONDecodeError:
@@ -86,19 +92,19 @@ def call_json(client, prompt, user_text="", model=None):
     return {}
 
 
-def extract_one(client, cv_text, jmp_text, model=None):
+def extract_one(client, cv_text, jmp_text, model=None, meter=None):
     cv_text = (cv_text or "")[:MAX_CV_CHARS]
-    oa1 = call_json(client, OA1_PROMPT, cv_text, model=model) if cv_text.strip() else {}
+    oa1 = call_json(client, OA1_PROMPT, cv_text, model=model, meter=meter) if cv_text.strip() else {}
 
     name = str(oa1.get("name", "") or "").strip()
-    gender = call_json(client, GENDER_PROMPT.format(name=name), model=model) if name else {}
+    gender = call_json(client, GENDER_PROMPT.format(name=name), model=model, meter=meter) if name else {}
 
     research_interest = str(oa1.get("research interest", "") or "")
     papers_str = json.dumps(oa1.get("papers", ""))[:4000] if oa1.get("papers") else ""
     research = {}
     if research_interest or papers_str:
         research = call_json(client, RESEARCH_CLASSIFY_PROMPT.format(
-            research_interest=research_interest[:4000], papers=papers_str), model=model)
+            research_interest=research_interest[:4000], papers=papers_str), model=model, meter=meter)
 
     return {
         "oa1": oa1,

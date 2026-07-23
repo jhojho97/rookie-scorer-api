@@ -36,6 +36,7 @@ import build_set_D as D
 from build_set_E import embed as embed_jmp_texts
 from build_scibert_dataset import extract_jmp_sections
 from local_shap_xgb import LocalExplainer
+from pricing import UsageMeter
 
 
 class CandidateScorer:
@@ -101,8 +102,11 @@ class CandidateScorer:
         cv_text = cv_text or ""
         jmp_text = jmp_text or ""
 
+        # Meter every LLM call in this scoring so the response can report $ cost.
+        meter = UsageMeter()
+
         # 1. OA1 extraction (Set C + names for Set D) via the chosen provider
-        rec = self._extract_one(self.extract_client, cv_text, jmp_text)
+        rec = self._extract_one(self.extract_client, cv_text, jmp_text, meter=meter)
 
         # 2. Set C (27 structured CV variables)
         set_c = build_set_c(rec)
@@ -117,7 +121,7 @@ class CandidateScorer:
 
         # 4. Set E (JMP embedding, paper's method; zero vector if no JMP)
         if jmp_text.strip():
-            vec = embed_jmp_texts([jmp_text])[0]
+            vec = embed_jmp_texts([jmp_text], meter=meter)[0]
         else:
             vec = np.zeros(256, dtype=float)
         set_e = {f"{i}_dt": float(vec[i]) for i in range(256)}
@@ -137,4 +141,6 @@ class CandidateScorer:
             "cv_chars": len(cv_text),
             "jmp_chars": len(jmp_text),
         }
+        # per-scoring token cost (USD) so the frontend can meter user budgets
+        result["cost"] = meter.summary()
         return result

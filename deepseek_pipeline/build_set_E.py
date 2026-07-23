@@ -61,7 +61,7 @@ def _get_encoder():
         return tiktoken.get_encoding("cl100k_base")
 
 
-def _embed_token_windows(client, windows):
+def _embed_token_windows(client, windows, meter=None):
     """Embed a list of token-id lists; return list of first-256-dim vectors.
     Batches by a token budget so no single request exceeds the API cap."""
     vecs, i = [], 0
@@ -70,11 +70,14 @@ def _embed_token_windows(client, windows):
         while i < len(windows) and (not batch or tok + len(windows[i]) <= REQ_TOKEN_BUDGET):
             batch.append(windows[i]); tok += len(windows[i]); i += 1
         resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+        if meter is not None and getattr(resp, "usage", None) is not None:
+            meter.add("embedding", EMBED_MODEL,
+                      getattr(resp.usage, "prompt_tokens", 0), 0)
         vecs.extend(np.asarray(d.embedding[:256], dtype=float) for d in resp.data)
     return vecs
 
 
-def embed(texts):
+def embed(texts, meter=None):
     """
     Reproduce the paper's JMP embedding exactly:
       - text-embedding-3-large, keep the first 256 dimensions
@@ -117,7 +120,7 @@ def embed(texts):
 
     print(f"  embedding {len(windows)} windows for {sum(1 for t in texts if (t or '').strip())} "
           f"papers ({n_long} papers exceeded {MAX_TOKENS} tokens -> sliding-window averaged)")
-    vecs = _embed_token_windows(client, windows)
+    vecs = _embed_token_windows(client, windows, meter=meter)
 
     # Average all windows belonging to the same paper.
     from collections import defaultdict

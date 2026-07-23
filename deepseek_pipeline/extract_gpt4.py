@@ -39,6 +39,6 @@ def get_client():
     return OpenAI(api_key=key)
 
 
-def extract_one(client, cv_text, jmp_text):
+def extract_one(client, cv_text, jmp_text, meter=None):
     """Same as extract_deepseek.extract_one but pinned to the GPT-4 model."""
-    return _extract_one_with_model(client, cv_text, jmp_text, model=GPT4_MODEL)
+    return _extract_one_with_model(client, cv_text, jmp_text, model=GPT4_MODEL, meter=meter)
