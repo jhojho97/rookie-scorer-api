@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # and inference.py os.chdir(ROOT), so bundled data files line up.
 COPY . .
 
-# HF Spaces route public traffic to app_port (see README.md frontmatter).
+# Bind to $PORT when the host injects one (Render sets PORT, default 10000);
+# fall back to 7860 for local runs / HF Spaces. Shell form so ${PORT} expands.
 EXPOSE 7860
-
-CMD ["uvicorn", "deepseek_pipeline.webapp.app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD uvicorn deepseek_pipeline.webapp.app:app --host 0.0.0.0 --port ${PORT:-7860}
