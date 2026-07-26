@@ -168,6 +168,13 @@ class LocalExplainer:
             data, train_test_year=train_test_year
         )
 
+        # Interventional probability SHAP integrates over the background, so its
+        # memory/compute scale with the background size (heaviest for the 256-dim
+        # embedding model). Subsample it to keep the serving process well under
+        # small-instance RAM limits (e.g. Render 512MB). SHAP stays additive, so
+        # base + sum(phi) == model output regardless of this size — the PREDICTION
+        # is unchanged; only the baseline/attribution split shifts slightly.
+        bg_n = int(os.environ.get("ROOKIE_SHAP_BG", "40"))
         for s in self.sets:
             X_train_full, _ = feature_matrices[s]
             # Reuse cached model if shap_xgb.py already trained it (same key)
@@ -175,6 +182,8 @@ class LocalExplainer:
                 X_train_full, y_train[target], treatment_train,
                 target=f"{s}_{target}",
             )
+            if len(X_bg) > bg_n:
+                X_bg = X_bg.sample(n=bg_n, random_state=42)
             self.models[s] = model
             self.backgrounds[s] = X_bg
             self.feature_names[s] = list(X_train_full.columns)
