@@ -40,6 +40,10 @@ EMBED_MODEL = "text-embedding-3-large"
 MAX_TOKENS  = 8191        # model input limit (paper's threshold)
 STRIDE      = 100         # sliding-window stride (paper: 100-token stride)
 REQ_TOKEN_BUDGET = 250000 # keep each embeddings request under the API token cap
+# Serving guard: a pathologically long JMP intro would spawn hundreds of sliding
+# windows -> memory + latency + cost blow-up. Cap the tokens embedded per paper
+# (>= MAX_TOKENS keeps normal papers untouched). Override via ROOKIE_MAX_JMP_TOKENS.
+SERVE_MAX_TOKENS = int(os.environ.get("ROOKIE_MAX_JMP_TOKENS", "16382"))
 
 
 def get_jmp_text(folder: Path, cached: dict | None) -> str:
@@ -108,6 +112,8 @@ def embed(texts, meter=None):
         if not t:
             continue                                  # zero vector
         toks = enc.encode(t)
+        if len(toks) > SERVE_MAX_TOKENS:              # bound pathologically long intros
+            toks = toks[:SERVE_MAX_TOKENS]
         if len(toks) <= MAX_TOKENS:
             windows.append(toks); owner.append(i)
         else:
