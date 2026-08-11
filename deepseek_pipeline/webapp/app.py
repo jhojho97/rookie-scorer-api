@@ -90,8 +90,9 @@ def _startup():
     SCORER = CandidateScorer(DATA_CSV, target=TARGET, fetch_2degree=FETCH_2DEG)
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
+    # Allow HEAD too so uptime pingers (which default to HEAD) get 200, not 405.
     return {"status": "ok", "target": TARGET,
             "model_ready": SCORER is not None,
             "fetch_2degree": FETCH_2DEG}
