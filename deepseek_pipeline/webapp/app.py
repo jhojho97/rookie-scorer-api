@@ -52,6 +52,13 @@ TARGET   = os.environ.get("ROOKIE_TARGET", "pub_w_top_5pct")
 # web latency; set ROOKIE_FETCH_2DEGREE=1 to enable.
 FETCH_2DEG = os.environ.get("ROOKIE_FETCH_2DEGREE", "0") == "1"
 
+# Max candidates per batch submission. Justification: scoring is SEQUENTIAL (one
+# candidate at a time, to keep peak memory under the 512MB free tier) and each
+# candidate is dominated by ~30-60s of LLM calls. 20 keeps a batch job to roughly
+# 10-25 min and bounded cost (~$0.06-1.20), which stays within the free instance's
+# stability window. Raise via ROOKIE_MAX_BATCH after moving to a bigger instance.
+MAX_BATCH = int(os.environ.get("ROOKIE_MAX_BATCH", "20"))
+
 # --- Auth + CORS -------------------------------------------------------------
 # Scoring endpoints require a shared token in the  X-API-Key  header. Set
 # API_TOKEN as a secret in the deployment. Fail closed: if it's unset, scoring
@@ -95,7 +102,8 @@ def health():
     # Allow HEAD too so uptime pingers (which default to HEAD) get 200, not 405.
     return {"status": "ok", "target": TARGET,
             "model_ready": SCORER is not None,
-            "fetch_2degree": FETCH_2DEG}
+            "fetch_2degree": FETCH_2DEG,
+            "max_batch": MAX_BATCH}
 
 
 def _read_jmp(filename, data):
@@ -207,6 +215,9 @@ async def predict_batch_files(background: BackgroundTasks,
         raise HTTPException(503, "Model not ready.")
     if not cv:
         raise HTTPException(422, "Provide at least one cv file.")
+    if len(cv) > MAX_BATCH:
+        raise HTTPException(422, f"Batch limit is {MAX_BATCH} candidates per "
+                                 f"submission; you sent {len(cv)}.")
     if jmp and len(jmp) != len(cv):
         raise HTTPException(422, "If jmp files are provided, there must be exactly "
                                  "one per cv, in the same order (use a 0-byte file "
