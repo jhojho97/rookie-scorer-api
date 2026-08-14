@@ -24,6 +24,7 @@ import json
 import time
 import argparse
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -41,7 +42,10 @@ except ImportError:
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 # Override the extraction model without editing code, e.g.
 #   PowerShell:  $env:DEEPSEEK_MODEL = "deepseek-reasoner"
-DEEPSEEK_MODEL    = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# Default is v4-flash, NOT the `deepseek-chat` alias: since the alias was
+# deprecated (2026/07/24) it routes to v4-pro, which roughly DOUBLED scoring
+# latency and TRIPLED cost for no measured accuracy gain on this extraction.
+DEEPSEEK_MODEL    = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 MAX_CV_CHARS      = 30000
 MAX_RETRIES       = 4
 
@@ -96,15 +100,29 @@ def extract_one(client, cv_text, jmp_text, model=None, meter=None):
     cv_text = (cv_text or "")[:MAX_CV_CHARS]
     oa1 = call_json(client, OA1_PROMPT, cv_text, model=model, meter=meter) if cv_text.strip() else {}
 
+    # The gender and research-area calls both consume OA1's output, so they must
+    # follow it -- but they do not depend on EACH OTHER. Running them
+    # concurrently turns a 3-call chain into 2 round-trips, cutting roughly a
+    # third off extraction latency (they are pure network waits).
     name = str(oa1.get("name", "") or "").strip()
-    gender = call_json(client, GENDER_PROMPT.format(name=name), model=model, meter=meter) if name else {}
-
     research_interest = str(oa1.get("research interest", "") or "")
     papers_str = json.dumps(oa1.get("papers", ""))[:4000] if oa1.get("papers") else ""
-    research = {}
-    if research_interest or papers_str:
-        research = call_json(client, RESEARCH_CLASSIFY_PROMPT.format(
-            research_interest=research_interest[:4000], papers=papers_str), model=model, meter=meter)
+
+    def _gender():
+        if not name:
+            return {}
+        return call_json(client, GENDER_PROMPT.format(name=name), model=model, meter=meter)
+
+    def _research():
+        if not (research_interest or papers_str):
+            return {}
+        return call_json(client, RESEARCH_CLASSIFY_PROMPT.format(
+            research_interest=research_interest[:4000], papers=papers_str),
+            model=model, meter=meter)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_gender, f_research = pool.submit(_gender), pool.submit(_research)
+        gender, research = f_gender.result(), f_research.result()
 
     return {
         "oa1": oa1,

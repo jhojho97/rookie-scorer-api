@@ -20,6 +20,7 @@ CandidateScorer at app startup and call .score() per request.
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -62,7 +63,7 @@ class CandidateScorer:
         else:
             from extract_deepseek import get_client as _get_client, extract_one as _extract
             print(f"[scorer] extraction provider = DeepSeek "
-                  f"({os.environ.get('DEEPSEEK_MODEL', 'deepseek-chat')})")
+                  f"({os.environ.get('DEEPSEEK_MODEL', 'deepseek-v4-flash')})")
         self.extract_client = _get_client()
         self._extract_one = _extract
 
@@ -76,6 +77,12 @@ class CandidateScorer:
         # 3. Model + SHAP explainer (loads cached C/D/E models from shap_models/)
         print(f"[scorer] building explainer for target={target} ...")
         self.explainer = LocalExplainer(data_csv, target=target, sets=sets)
+        # score() is called concurrently by batch workers. Everything before the
+        # explain step is network-bound and thread-safe, but shap.TreeExplainer
+        # is neither thread-safe nor cheap in memory (it materialises the
+        # background matrix), so exactly one candidate may be in it at a time.
+        # This is what keeps peak RSS flat as ROOKIE_BATCH_WORKERS rises.
+        self._explain_lock = threading.Lock()
         print("[scorer] ready.")
 
     def _load_byu(self, byu_year):
@@ -128,7 +135,8 @@ class CandidateScorer:
 
         # 5. Assemble the model input row and explain
         row = {**set_c, **set_d, **set_e}
-        result = self.explainer.explain(row, top_n=top_n)
+        with self._explain_lock:
+            result = self.explainer.explain(row, top_n=top_n)
 
         # attach a little context for the UI
         oa1 = rec.get("oa1", {}) or {}

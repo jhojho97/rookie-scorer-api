@@ -15,6 +15,7 @@ Values are USD per 1,000,000 tokens: [input_rate, output_rate].
 
 import os
 import json
+import threading
 import warnings
 
 # USD per 1,000,000 tokens: model -> (input_rate, output_rate).
@@ -70,17 +71,21 @@ def cost_usd(model, input_tokens=0, output_tokens=0):
 
 class UsageMeter:
     """Accumulates per-call token usage during one score() and totals the cost.
-    Create one per request (not shared) so it is safe under concurrency."""
+    Create one per request (never share across requests). Within a request it IS
+    written from several threads -- the extraction step fires its gender and
+    research-area calls in parallel -- so add() takes a lock."""
 
     def __init__(self):
         self._calls = []   # list of dicts: stage, model, input_tokens, output_tokens
+        self._lock = threading.Lock()
 
     def add(self, stage, model, input_tokens=0, output_tokens=0):
-        self._calls.append({
-            "stage": stage, "model": model,
-            "input_tokens": int(input_tokens or 0),
-            "output_tokens": int(output_tokens or 0),
-        })
+        with self._lock:
+            self._calls.append({
+                "stage": stage, "model": model,
+                "input_tokens": int(input_tokens or 0),
+                "output_tokens": int(output_tokens or 0),
+            })
 
     def summary(self):
         """Compact, JSON-serialisable cost report for the API response."""

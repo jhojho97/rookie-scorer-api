@@ -25,10 +25,13 @@ Run:
 import os
 import io
 import sys
+import time
 import uuid
 import zipfile
 import tempfile
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import (FastAPI, UploadFile, File, Form, HTTPException,
@@ -52,12 +55,17 @@ TARGET   = os.environ.get("ROOKIE_TARGET", "pub_w_top_5pct")
 # web latency; set ROOKIE_FETCH_2DEGREE=1 to enable.
 FETCH_2DEG = os.environ.get("ROOKIE_FETCH_2DEGREE", "0") == "1"
 
-# Max candidates per batch submission. Justification: scoring is SEQUENTIAL (one
-# candidate at a time, to keep peak memory under the 512MB free tier) and each
-# candidate is dominated by ~30-60s of LLM calls. 20 keeps a batch job to roughly
-# 10-25 min and bounded cost (~$0.06-1.20), which stays within the free instance's
-# stability window. Raise via ROOKIE_MAX_BATCH after moving to a bigger instance.
+# Max candidates per batch submission. Cost stays bounded (~$0.06-1.20 for 20)
+# and, with BATCH_WORKERS parallelism, a full batch runs in a few minutes rather
+# than 10-25. Raise via ROOKIE_MAX_BATCH after moving to a bigger instance.
 MAX_BATCH = int(os.environ.get("ROOKIE_MAX_BATCH", "20"))
+
+# How many candidates to score concurrently within one batch job. Per candidate
+# the wall time is ~95% network wait (3 LLM extraction calls + BYU scrape +
+# embedding), so threads overlap almost perfectly. Peak MEMORY stays at roughly
+# one candidate because the only memory-heavy step (TreeSHAP) is serialised
+# behind a lock inside CandidateScorer.score -- important on Render's 512MB tier.
+BATCH_WORKERS = max(1, int(os.environ.get("ROOKIE_BATCH_WORKERS", "4")))
 
 # --- Auth + CORS -------------------------------------------------------------
 # Scoring endpoints require a shared token in the  X-API-Key  header. Set
@@ -78,6 +86,48 @@ def require_key(x_api_key: str = Header(default="")):
         raise HTTPException(503, "Server is missing API_TOKEN configuration.")
     if x_api_key != API_TOKEN:
         raise HTTPException(401, "Invalid or missing X-API-Key.")
+
+
+# --- Upload tickets ----------------------------------------------------------
+# The frontend proxies API calls through Vercel so the browser never sees
+# API_TOKEN. But Vercel functions cap the REQUEST BODY at 4.5MB, which a batch of
+# CV+JMP PDFs blows straight past (FUNCTION_PAYLOAD_TOO_LARGE). So file uploads
+# go from the browser DIRECTLY here, authorised by a single-use, short-lived
+# ticket that the (authenticated) Vercel route mints with the real API key.
+# The long-lived API_TOKEN still never reaches the browser.
+TICKET_TTL = int(os.environ.get("ROOKIE_TICKET_TTL", "600"))   # seconds
+_TICKETS: dict[str, float] = {}                                # ticket -> expiry
+_TICKET_LOCK = threading.Lock()
+
+
+def _issue_ticket() -> dict:
+    now = time.time()
+    ticket = uuid.uuid4().hex + uuid.uuid4().hex
+    with _TICKET_LOCK:
+        # opportunistic sweep so the dict can't grow without bound
+        for t, exp in [(t, e) for t, e in _TICKETS.items() if e < now]:
+            _TICKETS.pop(t, None)
+        _TICKETS[ticket] = now + TICKET_TTL
+    return {"ticket": ticket, "expires_in": TICKET_TTL}
+
+
+def _consume_ticket(ticket: str) -> bool:
+    """Validate and burn a ticket. Single-use: a replayed ticket is rejected."""
+    with _TICKET_LOCK:
+        expiry = _TICKETS.pop(ticket, None)
+    return expiry is not None and expiry >= time.time()
+
+
+def require_key_or_ticket(x_api_key: str = Header(default=""),
+                          x_upload_ticket: str = Header(default="")):
+    """Auth for the upload endpoints: the shared API key OR a valid ticket."""
+    if not API_TOKEN:
+        raise HTTPException(503, "Server is missing API_TOKEN configuration.")
+    if x_api_key == API_TOKEN:
+        return
+    if x_upload_ticket and _consume_ticket(x_upload_ticket):
+        return
+    raise HTTPException(401, "Invalid or missing X-API-Key / X-Upload-Ticket.")
 
 
 app = FastAPI(title="Rookie Research Potential API", version="1.0")
@@ -103,7 +153,17 @@ def health():
     return {"status": "ok", "target": TARGET,
             "model_ready": SCORER is not None,
             "fetch_2degree": FETCH_2DEG,
-            "max_batch": MAX_BATCH}
+            "max_batch": MAX_BATCH,
+            "batch_workers": BATCH_WORKERS}
+
+
+@app.post("/upload-ticket", dependencies=[Depends(require_key)])
+def upload_ticket():
+    """Mint a single-use, short-lived ticket that authorises ONE direct upload.
+    Called server-side by the frontend proxy (which holds the API key) after it
+    has authenticated the user; the browser then uploads straight to this API,
+    sidestepping the proxy's 4.5MB body limit."""
+    return _issue_ticket()
 
 
 def _read_jmp(filename, data):
@@ -113,7 +173,7 @@ def _read_jmp(filename, data):
 
 
 # --- Single candidate --------------------------------------------------------
-@app.post("/predict", dependencies=[Depends(require_key)])
+@app.post("/predict", dependencies=[Depends(require_key_or_ticket)])
 async def predict(cv: UploadFile = File(...),
                   jmp: UploadFile = File(None),
                   top_n: int = 5):
@@ -135,23 +195,43 @@ async def predict(cv: UploadFile = File(...),
 
 # --- Batch: shared scoring loop ----------------------------------------------
 def _score_job(job_id: str, candidates: list[dict], top_n: int):
-    """Score a prepared list of candidates sequentially (one at a time, so peak
-    memory is independent of batch size). Each candidate is a dict with keys
-    name / cv_text / jmp_text. Results/progress are written into JOBS[job_id]."""
+    """Score a prepared list of candidates, up to BATCH_WORKERS at a time. Each
+    candidate is a dict with keys name / cv_text / jmp_text.
+
+    Concurrency is safe here because a candidate's wall time is dominated by
+    network waits (LLM extraction, BYU lookup, embedding) while the memory-heavy
+    TreeSHAP step is serialised inside CandidateScorer.score -- so peak memory
+    stays at ~one candidate no matter how many workers run.
+
+    Results are written back IN SUBMISSION ORDER (slot per candidate) so the
+    output does not shuffle just because one candidate finished first."""
     job = JOBS[job_id]
     try:
-        job["total"] = len(candidates)
-        for i, c in enumerate(candidates):
+        n = len(candidates)
+        job["total"] = n
+        slots: list[dict | None] = [None] * n
+        lock = threading.Lock()
+
+        def run(i: int) -> None:
+            c = candidates[i]
             try:
                 res = SCORER.score(c["cv_text"], c["jmp_text"], top_n=top_n)
                 res["candidate"] = c["name"]
-                job["results"].append(res)
+            except Exception as e:
+                res = {"candidate": c["name"], "status": "error", "reason": str(e)}
+            with lock:
+                slots[i] = res
                 job["cost_usd"] = round(
                     job.get("cost_usd", 0.0) + (res.get("cost", {}) or {}).get("usd", 0.0), 6)
-            except Exception as e:
-                job["results"].append({"candidate": c["name"],
-                                       "status": "error", "reason": str(e)})
-            job["done"] = i + 1
+                job["done"] += 1
+                # Publish completed results so far, in order, for live polling.
+                job["results"] = [r for r in slots if r is not None]
+
+        workers = max(1, min(BATCH_WORKERS, n))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(run, range(n)))
+
+        job["results"] = [r for r in slots if r is not None]
         job["status"] = "done"
     except Exception as e:
         job["status"] = "error"
@@ -184,7 +264,7 @@ def _run_batch(job_id: str, zip_bytes: bytes, top_n: int):
         JOBS[job_id]["reason"] = str(e)
 
 
-@app.post("/predict/batch", dependencies=[Depends(require_key)])
+@app.post("/predict/batch", dependencies=[Depends(require_key_or_ticket)])
 async def predict_batch(background: BackgroundTasks,
                         archive: UploadFile = File(...), top_n: int = 5):
     """Batch from a .zip of candidate folders (each folder = one candidate with
@@ -200,7 +280,7 @@ async def predict_batch(background: BackgroundTasks,
 
 
 # --- Batch B: loose files as explicit CV+JMP pairs ---------------------------
-@app.post("/predict/batch_files", dependencies=[Depends(require_key)])
+@app.post("/predict/batch_files", dependencies=[Depends(require_key_or_ticket)])
 async def predict_batch_files(background: BackgroundTasks,
                               cv: list[UploadFile] = File(...),
                               jmp: list[UploadFile] = File(default=[]),
