@@ -74,10 +74,25 @@ BATCH_WORKERS = max(1, int(os.environ.get("ROOKIE_BATCH_WORKERS", "4")))
 API_TOKEN = os.environ.get("API_TOKEN", "")
 
 # Restrict CORS to your frontend origin(s). Set ALLOWED_ORIGINS to a
-# comma-separated list of URLs (e.g. your Streamlit Space). Falls back to "*"
+# comma-separated list of URLs (e.g. your Vercel app). Falls back to "*"
 # only if unset -- always set it in production.
+#
+# Entries are NORMALISED before use, because an Origin header is scheme + host
+# + port and nothing else: browsers never send a trailing slash or a path, and
+# they lowercase the origin. A value of "https://example.com/" therefore matches
+# NOTHING and every preflight fails with "Disallowed CORS origin" -- which is
+# invisible for as long as traffic arrives server-side (where CORS does not
+# apply) and only breaks when the browser starts calling this API directly.
+def _norm_origin(o: str) -> str:
+    o = o.strip().rstrip("/")
+    if "//" in o:                       # keep scheme://host, drop any path
+        scheme, _, rest = o.partition("//")
+        o = f"{scheme}//{rest.split('/', 1)[0]}"
+    return o.lower()
+
+
 _origins = os.environ.get("ALLOWED_ORIGINS", "").strip()
-ALLOW_ORIGINS = [o.strip() for o in _origins.split(",") if o.strip()] or ["*"]
+ALLOW_ORIGINS = [_norm_origin(o) for o in _origins.split(",") if o.strip()] or ["*"]
 
 
 def require_key(x_api_key: str = Header(default="")):
@@ -129,6 +144,8 @@ def require_key_or_ticket(x_api_key: str = Header(default=""),
         return
     raise HTTPException(401, "Invalid or missing X-API-Key / X-Upload-Ticket.")
 
+
+print(f"[cors] allowed origins = {ALLOW_ORIGINS}", flush=True)
 
 app = FastAPI(title="Rookie Research Potential API", version="1.0")
 app.add_middleware(
