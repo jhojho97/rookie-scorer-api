@@ -103,6 +103,86 @@ def require_key(x_api_key: str = Header(default="")):
         raise HTTPException(401, "Invalid or missing X-API-Key.")
 
 
+# --- Per-user spend limits ---------------------------------------------------
+# Every scoring spends real money on the DeepSeek + OpenAI keys THIS server
+# holds. Registration is open, so without a server-side cap any account can burn
+# the operator's credits in a loop -- a client-side counter cannot stop that,
+# since the client is the untrusted party. Callers are identified by the
+# X-User-Id the authenticated frontend proxy attaches (the browser cannot forge
+# it: reaching this API at all requires the API key or a proxy-minted ticket).
+#
+# State is in-memory, so it resets when the instance restarts. That is a real
+# limitation, not a design choice -- it bounds runaway usage within an uptime
+# window rather than enforcing a true monthly budget. Move to Redis/Postgres if
+# the cap ever needs to be authoritative.
+USER_MONTHLY_USD = float(os.environ.get("ROOKIE_USER_MONTHLY_USD", "5"))
+USER_HOURLY_SCORES = int(os.environ.get("ROOKIE_USER_HOURLY_SCORES", "60"))
+
+_SPEND: dict[str, list[tuple[float, float]]] = {}   # uid -> [(ts, usd)]
+_SCORES: dict[str, list[float]] = {}                # uid -> [ts of each scoring]
+_SPEND_LOCK = threading.Lock()
+
+
+def _month_start() -> float:
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    return now.replace(day=1, hour=0, minute=0, second=0,
+                       microsecond=0).timestamp()
+
+
+def user_usage(uid: str) -> dict:
+    """This user's spend so far this month and scorings in the last hour."""
+    now = time.time()
+    since_month, since_hour = _month_start(), now - 3600
+    with _SPEND_LOCK:
+        spent = sum(u for ts, u in _SPEND.get(uid, []) if ts >= since_month)
+        recent = sum(1 for ts in _SCORES.get(uid, []) if ts >= since_hour)
+    return {
+        "uid": uid,
+        "month_usd": round(spent, 6),
+        "cap_usd": USER_MONTHLY_USD,
+        "remaining_usd": round(max(USER_MONTHLY_USD - spent, 0.0), 6),
+        "scores_last_hour": recent,
+        "hourly_limit": USER_HOURLY_SCORES,
+        "enforced": True,
+        # Be explicit that this window is not durable, so nobody reads the
+        # number as a guaranteed billing total.
+        "resets_on_restart": True,
+    }
+
+
+def enforce_budget(uid: str) -> None:
+    """Refuse new work once a user is over budget or scoring too fast.
+
+    This is a pre-check, not a reservation: work already in flight can carry a
+    user slightly past the cap before the next request is refused. That is fine
+    for a spend guard (the overshoot is one scoring, ~$0.001) and avoids holding
+    a lock across a minute of network calls."""
+    if not uid or uid == "anonymous":
+        return                       # direct API-key callers (ops) are exempt
+    u = user_usage(uid)
+    if USER_MONTHLY_USD > 0 and u["month_usd"] >= USER_MONTHLY_USD:
+        cap = f"{USER_MONTHLY_USD:.2f}" if USER_MONTHLY_USD >= 0.01 else f"{USER_MONTHLY_USD:g}"
+        raise HTTPException(429, f"Monthly scoring budget of ${cap} "
+                                 f"reached (${u['month_usd']:.4f} used).")
+    if USER_HOURLY_SCORES > 0 and u["scores_last_hour"] >= USER_HOURLY_SCORES:
+        raise HTTPException(429, f"Rate limit: {USER_HOURLY_SCORES} scorings per hour. "
+                                 f"Try again shortly.")
+
+
+def record_spend(uid: str, usd: float) -> None:
+    if not uid:
+        return
+    now = time.time()
+    with _SPEND_LOCK:
+        _SPEND.setdefault(uid, []).append((now, float(usd or 0.0)))
+        _SCORES.setdefault(uid, []).append(now)
+        # Keep only the current month / last hour so memory stays bounded.
+        cutoff = min(_month_start(), now - 3600)
+        _SPEND[uid] = [e for e in _SPEND[uid] if e[0] >= cutoff]
+        _SCORES[uid] = [t for t in _SCORES[uid] if t >= now - 3600]
+
+
 # --- Upload tickets ----------------------------------------------------------
 # The frontend proxies API calls through Vercel so the browser never sees
 # API_TOKEN. But Vercel functions cap the REQUEST BODY at 4.5MB, which a batch of
@@ -111,38 +191,52 @@ def require_key(x_api_key: str = Header(default="")):
 # ticket that the (authenticated) Vercel route mints with the real API key.
 # The long-lived API_TOKEN still never reaches the browser.
 TICKET_TTL = int(os.environ.get("ROOKIE_TICKET_TTL", "600"))   # seconds
-_TICKETS: dict[str, float] = {}                                # ticket -> expiry
+_TICKETS: dict[str, tuple[float, str]] = {}          # ticket -> (expiry, uid)
 _TICKET_LOCK = threading.Lock()
 
 
-def _issue_ticket() -> dict:
+def _issue_ticket(uid: str = "") -> dict:
+    """Mint a ticket BOUND to a user, so spend from the resulting upload is
+    attributed to them even though the browser sends no API key."""
     now = time.time()
     ticket = uuid.uuid4().hex + uuid.uuid4().hex
     with _TICKET_LOCK:
         # opportunistic sweep so the dict can't grow without bound
-        for t, exp in [(t, e) for t, e in _TICKETS.items() if e < now]:
+        for t in [t for t, (e, _) in _TICKETS.items() if e < now]:
             _TICKETS.pop(t, None)
-        _TICKETS[ticket] = now + TICKET_TTL
+        _TICKETS[ticket] = (now + TICKET_TTL, uid)
     return {"ticket": ticket, "expires_in": TICKET_TTL}
 
 
-def _consume_ticket(ticket: str) -> bool:
-    """Validate and burn a ticket. Single-use: a replayed ticket is rejected."""
+def _consume_ticket(ticket: str) -> tuple[bool, str]:
+    """Validate and burn a ticket. Single-use: a replayed ticket is rejected.
+    Returns (ok, uid)."""
     with _TICKET_LOCK:
-        expiry = _TICKETS.pop(ticket, None)
-    return expiry is not None and expiry >= time.time()
+        entry = _TICKETS.pop(ticket, None)
+    if entry is None:
+        return False, ""
+    expiry, uid = entry
+    return expiry >= time.time(), uid
 
 
 def require_key_or_ticket(x_api_key: str = Header(default=""),
-                          x_upload_ticket: str = Header(default="")):
-    """Auth for the upload endpoints: the shared API key OR a valid ticket."""
+                          x_upload_ticket: str = Header(default=""),
+                          x_user_id: str = Header(default="")) -> str:
+    """Auth for the upload endpoints: the shared API key OR a valid ticket.
+    Returns the caller's user id so their spend can be metered, and refuses
+    callers who are over budget."""
     if not API_TOKEN:
         raise HTTPException(503, "Server is missing API_TOKEN configuration.")
     if x_api_key == API_TOKEN:
-        return
-    if x_upload_ticket and _consume_ticket(x_upload_ticket):
-        return
-    raise HTTPException(401, "Invalid or missing X-API-Key / X-Upload-Ticket.")
+        uid = x_user_id or "anonymous"
+    else:
+        ok, ticket_uid = _consume_ticket(x_upload_ticket) if x_upload_ticket else (False, "")
+        if not ok:
+            raise HTTPException(401, "Invalid or missing X-API-Key / X-Upload-Ticket.")
+        # Trust the uid bound at mint time, never a header on this request.
+        uid = ticket_uid or "anonymous"
+    enforce_budget(uid)
+    return uid
 
 
 print(f"[cors] allowed origins = {ALLOW_ORIGINS}", flush=True)
@@ -171,16 +265,33 @@ def health():
             "model_ready": SCORER is not None,
             "fetch_2degree": FETCH_2DEG,
             "max_batch": MAX_BATCH,
-            "batch_workers": BATCH_WORKERS}
+            "batch_workers": BATCH_WORKERS,
+            "user_monthly_usd": USER_MONTHLY_USD,
+            "user_hourly_scores": USER_HOURLY_SCORES}
 
 
 @app.post("/upload-ticket", dependencies=[Depends(require_key)])
-def upload_ticket():
+def upload_ticket(x_user_id: str = Header(default="")):
     """Mint a single-use, short-lived ticket that authorises ONE direct upload.
     Called server-side by the frontend proxy (which holds the API key) after it
     has authenticated the user; the browser then uploads straight to this API,
-    sidestepping the proxy's 4.5MB body limit."""
-    return _issue_ticket()
+    sidestepping the proxy's 4.5MB body limit.
+
+    Budget is checked HERE as well as on the upload itself, so an over-quota
+    user is turned away before they wait through a large file transfer."""
+    enforce_budget(x_user_id)
+    out = _issue_ticket(x_user_id)
+    out["usage"] = user_usage(x_user_id) if x_user_id else None
+    return out
+
+
+@app.get("/usage", dependencies=[Depends(require_key)])
+def usage(x_user_id: str = Header(default="")):
+    """Server-side truth for a user's metered spend. The client keeps its own
+    ledger for instant feedback, but only this one gates anything."""
+    if not x_user_id:
+        raise HTTPException(422, "X-User-Id is required.")
+    return user_usage(x_user_id)
 
 
 def _read_jmp(filename, data):
@@ -190,10 +301,11 @@ def _read_jmp(filename, data):
 
 
 # --- Single candidate --------------------------------------------------------
-@app.post("/predict", dependencies=[Depends(require_key_or_ticket)])
+@app.post("/predict")
 async def predict(cv: UploadFile = File(...),
                   jmp: UploadFile = File(None),
-                  top_n: int = 5):
+                  top_n: int = 5,
+                  uid: str = Depends(require_key_or_ticket)):
     if SCORER is None:
         raise HTTPException(503, "Model not ready.")
     try:
@@ -202,6 +314,7 @@ async def predict(cv: UploadFile = File(...),
             raise HTTPException(422, "Could not extract text from the CV file.")
         jmp_text = _read_jmp(jmp.filename, await jmp.read()) if jmp else ""
         result = SCORER.score(cv_text, jmp_text, top_n=top_n)
+        record_spend(uid, (result.get("cost") or {}).get("usd", 0.0))
         return result
     except HTTPException:
         raise
@@ -211,7 +324,7 @@ async def predict(cv: UploadFile = File(...),
 
 
 # --- Batch: shared scoring loop ----------------------------------------------
-def _score_job(job_id: str, candidates: list[dict], top_n: int):
+def _score_job(job_id: str, candidates: list[dict], top_n: int, uid: str = ""):
     """Score a prepared list of candidates, up to BATCH_WORKERS at a time. Each
     candidate is a dict with keys name / cv_text / jmp_text.
 
@@ -236,10 +349,11 @@ def _score_job(job_id: str, candidates: list[dict], top_n: int):
                 res["candidate"] = c["name"]
             except Exception as e:
                 res = {"candidate": c["name"], "status": "error", "reason": str(e)}
+            spent = (res.get("cost", {}) or {}).get("usd", 0.0)
+            record_spend(uid, spent)
             with lock:
                 slots[i] = res
-                job["cost_usd"] = round(
-                    job.get("cost_usd", 0.0) + (res.get("cost", {}) or {}).get("usd", 0.0), 6)
+                job["cost_usd"] = round(job.get("cost_usd", 0.0) + spent, 6)
                 job["done"] += 1
                 # Publish completed results so far, in order, for live polling.
                 job["results"] = [r for r in slots if r is not None]
@@ -256,7 +370,7 @@ def _score_job(job_id: str, candidates: list[dict], top_n: int):
 
 
 # --- Batch A: a zip of candidate subfolders (each with a CV/JMP) -------------
-def _run_batch(job_id: str, zip_bytes: bytes, top_n: int):
+def _run_batch(job_id: str, zip_bytes: bytes, top_n: int, uid: str = ""):
     try:
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
@@ -275,15 +389,19 @@ def _run_batch(job_id: str, zip_bytes: bytes, top_n: int):
                 jmp_text = extract_jmp_sections(jfull) if jfull else ""
                 candidates.append({"name": folder.name,
                                    "cv_text": cv_text, "jmp_text": jmp_text})
-            _score_job(job_id, candidates, top_n)
+            if len(candidates) > MAX_BATCH:
+                raise ValueError(f"Batch limit is {MAX_BATCH} candidates; the "
+                                 f"archive contained {len(candidates)}.")
+            _score_job(job_id, candidates, top_n, uid)
     except Exception as e:
         JOBS[job_id]["status"] = "error"
         JOBS[job_id]["reason"] = str(e)
 
 
-@app.post("/predict/batch", dependencies=[Depends(require_key_or_ticket)])
+@app.post("/predict/batch")
 async def predict_batch(background: BackgroundTasks,
-                        archive: UploadFile = File(...), top_n: int = 5):
+                        archive: UploadFile = File(...), top_n: int = 5,
+                        uid: str = Depends(require_key_or_ticket)):
     """Batch from a .zip of candidate folders (each folder = one candidate with
     a CV and optional JMP; CV/JMP identified by filename + size heuristics)."""
     if SCORER is None:
@@ -291,18 +409,19 @@ async def predict_batch(background: BackgroundTasks,
     data = await archive.read()
     job_id = uuid.uuid4().hex[:12]
     JOBS[job_id] = {"status": "running", "done": 0, "total": None,
-                    "results": [], "cost_usd": 0.0}
-    background.add_task(_run_batch, job_id, data, top_n)
+                    "results": [], "cost_usd": 0.0, "uid": uid}
+    background.add_task(_run_batch, job_id, data, top_n, uid)
     return {"job_id": job_id}
 
 
 # --- Batch B: loose files as explicit CV+JMP pairs ---------------------------
-@app.post("/predict/batch_files", dependencies=[Depends(require_key_or_ticket)])
+@app.post("/predict/batch_files")
 async def predict_batch_files(background: BackgroundTasks,
                               cv: list[UploadFile] = File(...),
                               jmp: list[UploadFile] = File(default=[]),
                               name: list[str] = Form(default=[]),
-                              top_n: int = 5):
+                              top_n: int = 5,
+                              uid: str = Depends(require_key_or_ticket)):
     """Batch from loose files, paired by position: candidate i = cv[i] + jmp[i].
     `jmp` is optional; if provided it must have the same length as `cv` (send a
     0-byte file for a candidate that has no JMP). `name` optionally labels each
@@ -331,16 +450,21 @@ async def predict_batch_files(background: BackgroundTasks,
                  else (Path(cvf.filename).stem if cvf.filename else f"candidate_{i+1}"))
         candidates.append({"name": label, "cv_text": cv_text, "jmp_text": jmp_text})
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"status": "running", "done": 0,
-                    "total": len(candidates), "results": [], "cost_usd": 0.0}
-    background.add_task(_score_job, job_id, candidates, top_n)
+    JOBS[job_id] = {"status": "running", "done": 0, "total": len(candidates),
+                    "results": [], "cost_usd": 0.0, "uid": uid}
+    background.add_task(_score_job, job_id, candidates, top_n, uid)
     return {"job_id": job_id, "total": len(candidates)}
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_key)])
-def job_status(job_id: str):
+def job_status(job_id: str, x_user_id: str = Header(default="")):
     job = JOBS.get(job_id)
     if job is None:
+        raise HTTPException(404, "Unknown job_id.")
+    # A job id is guessable in principle, and results contain candidate names
+    # and CV-derived features. Only hand a job back to the user who created it.
+    owner = job.get("uid") or ""
+    if owner and x_user_id and owner != x_user_id:
         raise HTTPException(404, "Unknown job_id.")
     return {"status": job["status"],
             "progress": f"{job['done']}/{job['total']}" if job["total"] else "0/?",

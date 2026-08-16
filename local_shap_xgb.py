@@ -194,7 +194,45 @@ class LocalExplainer:
                 feature_perturbation="interventional",
                 model_output="probability",
             )
+        self.reference = self._build_reference(feature_matrices)
         print("  Explainer ready.")
+
+    # ── Reference cohort for percentile ranking ──────────────────────────────
+    def _build_reference(self, feature_matrices):
+        """Score distribution used to turn one candidate's raw score into a rank.
+
+        Built from the HELD-OUT split, not the whole dataset. The training rows
+        are partly memorised, and since ~95% of them are negatives that
+        memorisation drags the bulk of their scores DOWN — measured, the full
+        cohort's median is 17.5 against the held-out 20.5. Ranking a new
+        candidate against that deflated distribution would overstate their
+        percentile by up to ~12 points mid-range. Every real user is a candidate
+        the model has never seen, so the held-out rows are the honest comparison.
+        """
+        try:
+            probs = []
+            for s in self.sets:
+                X_test = feature_matrices[s][1]
+                probs.append(self.models[s].predict_proba(X_test.values)[:, 1])
+            ref = np.sort(np.mean(probs, axis=0))
+            print(f"  Reference cohort: {len(ref)} held-out candidates "
+                  f"(median score {np.median(ref) * 100:.1f}).")
+            return ref
+        except Exception as e:
+            print(f"  WARNING: no reference cohort ({e}); percentile unavailable.")
+            return None
+
+    def percentile_of(self, prediction):
+        """This score's rank within the reference cohort, 0-100, or None.
+
+        Midpoint rule for ties, so identical scores share one rank rather than
+        the first arbitrarily beating the second."""
+        ref = self.reference
+        if ref is None or len(ref) == 0:
+            return None
+        below = int(np.searchsorted(ref, prediction, side="left"))
+        equal = int(np.searchsorted(ref, prediction, side="right")) - below
+        return round(100.0 * (below + 0.5 * equal) / len(ref), 1)
 
     # ── Core: explain one candidate ──────────────────────────────────────────
     def explain(self, candidate_row, top_n=5, collapse_embeddings=True):
@@ -219,6 +257,7 @@ class LocalExplainer:
         factors = []          # list of dicts (one per interpretable feature)
         set_probs = []        # per-set predicted probability
         set_bases = []        # per-set baseline E[f(x)]
+        set_probs_by_name = {}  # set label -> that set's own probability
         skipped = []
 
         for s in self.sets:
@@ -238,6 +277,7 @@ class LocalExplainer:
             base = float(np.asarray(expl.base_values).reshape(-1)[0])
             set_probs.append(base + phi.sum())
             set_bases.append(base)
+            set_probs_by_name[s] = float(base + phi.sum())
 
             if s == "E" and collapse_embeddings:
                 # Collapse 256 embedding dims into one non-technical factor
@@ -278,10 +318,28 @@ class LocalExplainer:
             "target": self.target,
             "prediction": round(prediction, 4),
             "baseline": round(baseline, 4),
+            # Rank within the held-out cohort. The raw score is an UNCALIBRATED
+            # ranking value (scale_pos_weight inflates it: the true base rate is
+            # ~5% but the model's baseline output is ~0.20), so its magnitude
+            # means little on its own -- a median candidate scores ~0.18 and
+            # reads as a failure on any 0-100 dial. The ordering is what the
+            # model is good at, and a percentile shows exactly that.
+            "percentile": self.percentile_of(prediction),
+            "cohort_n": int(len(self.reference)) if self.reference is not None else 0,
             "sets_used": [s for s in self.sets if s not in skipped],
             "sets_skipped": skipped,
+            # Each set's OWN probability, before they are averaged into the
+            # ensemble. How far apart these three are is a cheap, honest measure
+            # of how much the model's components disagree about this candidate.
+            # It is NOT a calibrated confidence interval and must not be shown
+            # as one -- it says nothing about error against ground truth.
+            "set_predictions": {k: round(v, 4) for k, v in set_probs_by_name.items()},
             "top_factors": [
                 {
+                    # Raw column name as well as the friendly label, so callers
+                    # can classify a factor (e.g. changeable vs fixed) without
+                    # pattern-matching on display text.
+                    "feature": f["feature"],
                     "label": f["label"],
                     "value": f["value"],
                     "contribution": round(f["contribution"], 4),

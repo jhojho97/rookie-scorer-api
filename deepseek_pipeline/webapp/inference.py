@@ -21,6 +21,7 @@ CandidateScorer at app startup and call .score() per request.
 import os
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -137,6 +138,11 @@ class CandidateScorer:
         row = {**set_c, **set_d, **set_e}
         with self._explain_lock:
             result = self.explainer.explain(row, top_n=top_n)
+
+        # When this scoring actually happened. The client cannot derive it: a
+        # report is re-rendered, reopened from a table and exported to PDF long
+        # after the fact, so a render-time clock would silently relabel it.
+        result["scored_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
         # attach a little context for the UI
         oa1 = rec.get("oa1", {}) or {}
