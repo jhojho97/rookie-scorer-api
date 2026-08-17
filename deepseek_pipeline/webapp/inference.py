@@ -144,6 +144,14 @@ class CandidateScorer:
         # after the fact, so a render-time clock would silently relabel it.
         result["scored_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+        # Whether the CV was actually read. When extraction fails, Set C is
+        # all-defaults and Set D has no institution to match, so the score is
+        # computed from essentially no information -- but it still looks like a
+        # normal score. The caller has to be told, or it will present a number
+        # derived from a blank row as though it meant something.
+        result["extraction_ok"] = bool(rec.get("cv_extraction_ok", True))
+        result["extraction_problems"] = list(rec.get("extraction_problems") or [])
+
         # attach a little context for the UI
         oa1 = rec.get("oa1", {}) or {}
         result["candidate_name"] = oa1.get("name") or None

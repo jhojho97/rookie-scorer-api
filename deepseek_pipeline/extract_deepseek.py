@@ -48,6 +48,29 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 DEEPSEEK_MODEL    = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 MAX_CV_CHARS      = 30000
 MAX_RETRIES       = 4
+# Output ceiling for the OA1 JSON. This was 4096, which is NOT enough: the OA1
+# prompt asks for every abstract in the CV plus the full papers / coauthors /
+# presentations / awards / reviewer / membership / references lists, and a real
+# CV overruns it. The response was then cut off mid-JSON, failed to parse, and
+# -- because temperature is 0 and the call is deterministic -- failed identically
+# on all four retries before returning an EMPTY extraction. Measured on one real
+# candidate: 31,239 tokens and $0.02 spent to produce nothing, 7.8x the cost of
+# a single successful call.
+MAX_OUTPUT_TOKENS = int(os.environ.get("DEEPSEEK_MAX_OUTPUT_TOKENS", "16384"))
+# One growth step if even that overruns, before giving up with a clear error.
+MAX_OUTPUT_CEILING = int(os.environ.get("DEEPSEEK_MAX_OUTPUT_CEILING", "32768"))
+
+
+def _is_transient(exc) -> bool:
+    """Worth retrying? Rate limits and server faults are; a bad model id, a bad
+    key or a rejected parameter will fail the same way every time, so retrying
+    those just multiplies the bill."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        return True                      # network/timeout: no status, retry
+    return status == 429 or status >= 500
 
 
 def get_client():
@@ -58,9 +81,22 @@ def get_client():
 
 
 def call_json(client, prompt, user_text="", model=None, meter=None):
+    """Run one JSON-mode completion.
+
+    Returns (data, error). `error` is None on success; on failure `data` is {}
+    and `error` says why, so the caller can report a degraded extraction instead
+    of silently scoring an empty feature row.
+
+    Retries are deliberately narrow. The call is deterministic (temperature 0),
+    so repeating it after a truncated or unparseable response reproduces the
+    same response exactly -- the old code did that four times and paid for it
+    each time. Only a transient fault is worth another attempt; a response that
+    ran out of room gets more room instead.
+    """
     model = model or DEEPSEEK_MODEL
-    content = ""
+    budget = MAX_OUTPUT_TOKENS
     last_err = None
+
     for attempt in range(MAX_RETRIES):
         try:
             resp = client.chat.completions.create(
@@ -68,7 +104,7 @@ def call_json(client, prompt, user_text="", model=None, meter=None):
                 messages=[{"role": "user",
                            "content": prompt + ("\n" + user_text if user_text else "")}],
                 response_format={"type": "json_object"},
-                temperature=0.0, max_tokens=4096,
+                temperature=0.0, max_tokens=budget,
             )
             # record token usage as soon as the call succeeds (tokens are spent
             # even if JSON parsing below fails and we fall back to regex).
@@ -76,29 +112,67 @@ def call_json(client, prompt, user_text="", model=None, meter=None):
                 u = resp.usage
                 meter.add("extraction", model,
                           getattr(u, "prompt_tokens", 0), getattr(u, "completion_tokens", 0))
-            content = resp.choices[0].message.content
-            return json.loads(content)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", content or "", re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    pass
-        except Exception as e:
+
+            choice = resp.choices[0]
+            content = choice.message.content or ""
+
+            # Cut off at the output ceiling: the JSON is incomplete by
+            # definition. Grow the budget once rather than re-running the
+            # identical call and truncating in the identical place.
+            if getattr(choice, "finish_reason", None) == "length":
+                if budget < MAX_OUTPUT_CEILING:
+                    warnings.warn(f"[extract] response hit the {budget}-token output "
+                                  f"limit; retrying once at {MAX_OUTPUT_CEILING}.")
+                    budget = MAX_OUTPUT_CEILING
+                    continue
+                return {}, (f"the model's reply exceeded the {budget}-token output "
+                            f"limit even after being raised; the CV may be unusually long")
+
+            try:
+                return json.loads(content), None
+            except json.JSONDecodeError:
+                m = re.search(r"\{.*\}", content, re.DOTALL)
+                if m:
+                    try:
+                        return json.loads(m.group(0)), None
+                    except json.JSONDecodeError:
+                        pass
+                # Complete but unparseable -> deterministic, so do not hammer it.
+                return {}, "the model did not return valid JSON"
+
+        except Exception as e:                       # noqa: BLE001 - reported upward
             last_err = e
+            if not _is_transient(e):
+                warnings.warn(f"[extract] model={model!r} call failed permanently ({e}); "
+                              f"not retrying.")
+                return {}, f"the extraction service rejected the request ({e})"
             wait = 2 ** attempt
             warnings.warn(f"[extract] model={model!r} call failed ({e}); retry in {wait}s.")
             time.sleep(wait)
-    warnings.warn(f"[extract] model={model!r} FAILED after {MAX_RETRIES} retries "
-                  f"(last error: {last_err}). Returning EMPTY extraction -> Set C "
-                  f"will be all-default for this candidate. Check model access / key.")
-    return {}
+
+    warnings.warn(f"[extract] model={model!r} FAILED after {MAX_RETRIES} attempts "
+                  f"(last error: {last_err}).")
+    return {}, f"the extraction service did not respond ({last_err})"
 
 
 def extract_one(client, cv_text, jmp_text, model=None, meter=None):
+    """Extract one candidate.
+
+    Also reports whether the extraction actually worked. A failed OA1 call used
+    to return {} silently, which is indistinguishable downstream from a CV that
+    genuinely contains nothing: Set C comes out all-defaults, the model scores
+    that empty row, and the candidate gets a confident-looking number computed
+    from no information at all. Callers must be able to tell the two apart.
+    """
     cv_text = (cv_text or "")[:MAX_CV_CHARS]
-    oa1 = call_json(client, OA1_PROMPT, cv_text, model=model, meter=meter) if cv_text.strip() else {}
+    problems = []
+
+    if cv_text.strip():
+        oa1, err = call_json(client, OA1_PROMPT, cv_text, model=model, meter=meter)
+        if err:
+            problems.append(f"Could not read the CV: {err}.")
+    else:
+        oa1, problems = {}, ["No readable text was found in the CV file."]
 
     # The gender and research-area calls both consume OA1's output, so they must
     # follow it -- but they do not depend on EACH OTHER. Running them
@@ -110,19 +184,24 @@ def extract_one(client, cv_text, jmp_text, model=None, meter=None):
 
     def _gender():
         if not name:
-            return {}
+            return {}, None
         return call_json(client, GENDER_PROMPT.format(name=name), model=model, meter=meter)
 
     def _research():
         if not (research_interest or papers_str):
-            return {}
+            return {}, None
         return call_json(client, RESEARCH_CLASSIFY_PROMPT.format(
             research_interest=research_interest[:4000], papers=papers_str),
             model=model, meter=meter)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         f_gender, f_research = pool.submit(_gender), pool.submit(_research)
-        gender, research = f_gender.result(), f_research.result()
+        (gender, gender_err), (research, research_err) = f_gender.result(), f_research.result()
+
+    if gender_err:
+        problems.append(f"Could not infer gender: {gender_err}.")
+    if research_err:
+        problems.append(f"Could not classify research area: {research_err}.")
 
     return {
         "oa1": oa1,
@@ -130,6 +209,9 @@ def extract_one(client, cv_text, jmp_text, model=None, meter=None):
         "primary_area": research.get("primary_area", ""),
         "primary_method": research.get("primary_method", ""),
         "jmp_text": jmp_text or "",
+        # False => Set C is all-defaults and any score built on it is meaningless.
+        "cv_extraction_ok": bool(oa1),
+        "extraction_problems": problems,
     }
 
 
