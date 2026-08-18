@@ -42,6 +42,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.append(str(HERE))
 from inference import CandidateScorer, PIPE, ROOT          # noqa: E402
 from pdf_utils import extract_upload                        # noqa: E402
+from usage_store import make_store                          # noqa: E402
 sys.path.append(str(ROOT))
 from build_scibert_dataset import (                          # noqa: E402
     find_cv_file, find_jmp_file, extract_text, extract_jmp_sections,
@@ -111,32 +112,21 @@ def require_key(x_api_key: str = Header(default="")):
 # X-User-Id the authenticated frontend proxy attaches (the browser cannot forge
 # it: reaching this API at all requires the API key or a proxy-minted ticket).
 #
-# State is in-memory, so it resets when the instance restarts. That is a real
-# limitation, not a design choice -- it bounds runaway usage within an uptime
-# window rather than enforcing a true monthly budget. Move to Redis/Postgres if
-# the cap ever needs to be authoritative.
+# Counters live in USAGE (see usage_store): a Redis REST endpoint when one is
+# configured, otherwise in-process. The store reports whether it is durable, and
+# that flag is passed through to callers rather than assumed -- an in-process
+# counter resets on every spin-up of a free instance, which is precisely when a
+# user who waited out an idle timeout would get their budget back.
 USER_MONTHLY_USD = float(os.environ.get("ROOKIE_USER_MONTHLY_USD", "5"))
 USER_HOURLY_SCORES = int(os.environ.get("ROOKIE_USER_HOURLY_SCORES", "60"))
 
-_SPEND: dict[str, list[tuple[float, float]]] = {}   # uid -> [(ts, usd)]
-_SCORES: dict[str, list[float]] = {}                # uid -> [ts of each scoring]
-_SPEND_LOCK = threading.Lock()
-
-
-def _month_start() -> float:
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
-    return now.replace(day=1, hour=0, minute=0, second=0,
-                       microsecond=0).timestamp()
+USAGE = make_store()
 
 
 def user_usage(uid: str) -> dict:
-    """This user's spend so far this month and scorings in the last hour."""
-    now = time.time()
-    since_month, since_hour = _month_start(), now - 3600
-    with _SPEND_LOCK:
-        spent = sum(u for ts, u in _SPEND.get(uid, []) if ts >= since_month)
-        recent = sum(1 for ts in _SCORES.get(uid, []) if ts >= since_hour)
+    """This user's spend so far this month and scorings in the current hour."""
+    spent = USAGE.month_usd(uid)
+    recent = USAGE.hour_count(uid)
     return {
         "uid": uid,
         "month_usd": round(spent, 6),
@@ -145,9 +135,11 @@ def user_usage(uid: str) -> dict:
         "scores_last_hour": recent,
         "hourly_limit": USER_HOURLY_SCORES,
         "enforced": True,
-        # Be explicit that this window is not durable, so nobody reads the
-        # number as a guaranteed billing total.
-        "resets_on_restart": True,
+        # True only with an external store. When False the cap still applies
+        # within one process lifetime but is NOT a monthly guarantee -- say so
+        # rather than letting the number imply one.
+        "durable": bool(getattr(USAGE, "durable", False)),
+        "store": getattr(USAGE, "name", "memory"),
     }
 
 
@@ -173,14 +165,7 @@ def enforce_budget(uid: str) -> None:
 def record_spend(uid: str, usd: float) -> None:
     if not uid:
         return
-    now = time.time()
-    with _SPEND_LOCK:
-        _SPEND.setdefault(uid, []).append((now, float(usd or 0.0)))
-        _SCORES.setdefault(uid, []).append(now)
-        # Keep only the current month / last hour so memory stays bounded.
-        cutoff = min(_month_start(), now - 3600)
-        _SPEND[uid] = [e for e in _SPEND[uid] if e[0] >= cutoff]
-        _SCORES[uid] = [t for t in _SCORES[uid] if t >= now - 3600]
+    USAGE.add(uid, usd)
 
 
 # --- Upload tickets ----------------------------------------------------------
@@ -267,7 +252,9 @@ def health():
             "max_batch": MAX_BATCH,
             "batch_workers": BATCH_WORKERS,
             "user_monthly_usd": USER_MONTHLY_USD,
-            "user_hourly_scores": USER_HOURLY_SCORES}
+            "user_hourly_scores": USER_HOURLY_SCORES,
+            "usage_store": getattr(USAGE, "name", "memory"),
+            "usage_durable": bool(getattr(USAGE, "durable", False))}
 
 
 @app.post("/upload-ticket", dependencies=[Depends(require_key)])
