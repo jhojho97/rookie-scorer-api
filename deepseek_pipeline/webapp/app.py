@@ -21,7 +21,7 @@ Run:
   uvicorn app:app --reload --port 8000
   # interactive docs at http://localhost:8000/docs
 """
-
+import asyncio
 import os
 import io
 import sys
@@ -247,6 +247,8 @@ JOB_TTL = int(os.environ.get("ROOKIE_JOB_TTL_SECONDS", "3600"))     # 1 hour
 MAX_JOBS = int(os.environ.get("ROOKIE_MAX_JOBS", "200"))
 # Backstop so a job wedged in "running" cannot be retained forever.
 JOB_MAX_AGE = int(os.environ.get("ROOKIE_JOB_MAX_AGE_SECONDS", str(4 * 3600)))
+# How often the background sweeper runs, independent of incoming traffic.
+SWEEP_INTERVAL = int(os.environ.get("ROOKIE_SWEEP_INTERVAL_SECONDS", "300"))
 _JOBS_LOCK = threading.Lock()
 
 
@@ -292,15 +294,36 @@ def new_job(uid: str, total=None) -> dict:
             "expires_at": time.time() + JOB_TTL}
 
 
+async def _sweep_loop():
+    """Expire results on a timer, so deletion does not depend on traffic.
+
+    Sweeping only inside request handlers means a quiet instance keeps
+    confidential results past their window simply because nobody called it --
+    retention would be a side effect of load. This runs regardless. It is
+    cheap: a pass over at most MAX_JOBS entries under a lock.
+    """
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL)
+        try:
+            sweep_jobs()
+        except Exception as e:                       # noqa: BLE001
+            print(f"[jobs] sweep failed: {e}", flush=True)
+
+
 @app.on_event("startup")
 def _startup():
     global SCORER
     SCORER = CandidateScorer(DATA_CSV, target=TARGET, fetch_2degree=FETCH_2DEG)
+    asyncio.get_event_loop().create_task(_sweep_loop())
+    print(f"[jobs] retention {JOB_TTL}s, sweeping every {SWEEP_INTERVAL}s", flush=True)
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     # Allow HEAD too so uptime pingers (which default to HEAD) get 200, not 405.
+    # Also sweep here: the uptime monitor hits this every few minutes, which
+    # backs up the timer if that task ever dies.
+    sweep_jobs()
     return {"status": "ok", "target": TARGET,
             "model_ready": SCORER is not None,
             "fetch_2degree": FETCH_2DEG,
