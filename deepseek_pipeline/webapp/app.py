@@ -236,6 +236,61 @@ app.add_middleware(
 SCORER: CandidateScorer | None = None
 JOBS: dict[str, dict] = {}          # in-memory batch jobs (swap for Redis in prod)
 
+# Batch results are confidential: candidate names, parsed CV attributes and
+# per-feature SHAP for people who never agreed to be stored. They used to live
+# in JOBS until the process restarted, which on a busy instance could be days
+# and was retention by accident rather than by policy. They are now deleted a
+# fixed time after the job finishes, with a hard cap on how many are held at
+# once. The client saves a completed batch locally, so nothing is lost by the
+# server forgetting it.
+JOB_TTL = int(os.environ.get("ROOKIE_JOB_TTL_SECONDS", "3600"))     # 1 hour
+MAX_JOBS = int(os.environ.get("ROOKIE_MAX_JOBS", "200"))
+# Backstop so a job wedged in "running" cannot be retained forever.
+JOB_MAX_AGE = int(os.environ.get("ROOKIE_JOB_MAX_AGE_SECONDS", str(4 * 3600)))
+_JOBS_LOCK = threading.Lock()
+
+
+def _touch_job(job: dict) -> None:
+    """Restart the retention clock. Called as a job progresses so a long batch
+    is never swept mid-run, and again when it finishes."""
+    job["expires_at"] = time.time() + JOB_TTL
+
+
+def _is_expired(job: dict, now: float) -> bool:
+    """A RUNNING job never expires on the TTL. The retention clock is only
+    meaningful once there is a result to retain, and a single candidate can
+    outlive a short TTL on its own — sweeping then would delete work the user
+    is still waiting for. JOB_MAX_AGE still bounds a job stuck running."""
+    if now >= job.get("created_at", now) + JOB_MAX_AGE:
+        return True
+    if job.get("status") == "running":
+        return False
+    return now >= job.get("expires_at", 0)
+
+
+def sweep_jobs() -> int:
+    """Drop expired jobs, then the oldest if we are still over the cap."""
+    now = time.time()
+    with _JOBS_LOCK:
+        for jid in [j for j, v in JOBS.items() if _is_expired(v, now)]:
+            JOBS.pop(jid, None)
+        if len(JOBS) > MAX_JOBS:
+            # Evict finished jobs before running ones: dropping a job still in
+            # progress loses work the user paid for and is still waiting on.
+            oldest = sorted(JOBS.items(),
+                            key=lambda kv: (kv[1].get("status") == "running",
+                                            kv[1].get("created_at", 0)))
+            for jid, _ in oldest[:len(JOBS) - MAX_JOBS]:
+                JOBS.pop(jid, None)
+        return len(JOBS)
+
+
+def new_job(uid: str, total=None) -> dict:
+    sweep_jobs()
+    return {"status": "running", "done": 0, "total": total, "results": [],
+            "cost_usd": 0.0, "uid": uid, "created_at": time.time(),
+            "expires_at": time.time() + JOB_TTL}
+
 
 @app.on_event("startup")
 def _startup():
@@ -254,7 +309,9 @@ def health():
             "user_monthly_usd": USER_MONTHLY_USD,
             "user_hourly_scores": USER_HOURLY_SCORES,
             "usage_store": getattr(USAGE, "name", "memory"),
-            "usage_durable": bool(getattr(USAGE, "durable", False))}
+            "usage_durable": bool(getattr(USAGE, "durable", False)),
+            "job_ttl_seconds": JOB_TTL,
+            "jobs_held": len(JOBS)}
 
 
 @app.post("/upload-ticket", dependencies=[Depends(require_key)])
@@ -336,6 +393,11 @@ def _score_job(job_id: str, candidates: list[dict], top_n: int, uid: str = ""):
                 res["candidate"] = c["name"]
             except Exception as e:
                 res = {"candidate": c["name"], "status": "error", "reason": str(e)}
+            # Drop the CV and paper text as soon as this candidate is scored,
+            # rather than holding every candidate's document in memory until
+            # the whole batch finishes.
+            c["cv_text"] = c["jmp_text"] = ""
+
             spent = (res.get("cost", {}) or {}).get("usd", 0.0)
             record_spend(uid, spent)
             with lock:
@@ -344,6 +406,7 @@ def _score_job(job_id: str, candidates: list[dict], top_n: int, uid: str = ""):
                 job["done"] += 1
                 # Publish completed results so far, in order, for live polling.
                 job["results"] = [r for r in slots if r is not None]
+                _touch_job(job)   # a long batch must not expire while running
 
         workers = max(1, min(BATCH_WORKERS, n))
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -351,9 +414,11 @@ def _score_job(job_id: str, candidates: list[dict], top_n: int, uid: str = ""):
 
         job["results"] = [r for r in slots if r is not None]
         job["status"] = "done"
+        _touch_job(job)           # retention clock starts from completion
     except Exception as e:
         job["status"] = "error"
         job["reason"] = str(e)
+        _touch_job(job)
 
 
 # --- Batch A: a zip of candidate subfolders (each with a CV/JMP) -------------
@@ -395,8 +460,7 @@ async def predict_batch(background: BackgroundTasks,
         raise HTTPException(503, "Model not ready.")
     data = await archive.read()
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"status": "running", "done": 0, "total": None,
-                    "results": [], "cost_usd": 0.0, "uid": uid}
+    JOBS[job_id] = new_job(uid)
     background.add_task(_run_batch, job_id, data, top_n, uid)
     return {"job_id": job_id}
 
@@ -437,17 +501,22 @@ async def predict_batch_files(background: BackgroundTasks,
                  else (Path(cvf.filename).stem if cvf.filename else f"candidate_{i+1}"))
         candidates.append({"name": label, "cv_text": cv_text, "jmp_text": jmp_text})
     job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {"status": "running", "done": 0, "total": len(candidates),
-                    "results": [], "cost_usd": 0.0, "uid": uid}
+    JOBS[job_id] = new_job(uid, total=len(candidates))
     background.add_task(_score_job, job_id, candidates, top_n, uid)
     return {"job_id": job_id, "total": len(candidates)}
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_key)])
 def job_status(job_id: str, x_user_id: str = Header(default="")):
+    sweep_jobs()
     job = JOBS.get(job_id)
     if job is None:
-        raise HTTPException(404, "Unknown job_id.")
+        # Deliberately does not distinguish expired from never-existed: keeping
+        # tombstones to tell them apart would mean retaining a record of every
+        # batch ever run, which is the thing the expiry exists to avoid.
+        held = f"{JOB_TTL // 60} minutes" if JOB_TTL >= 60 else f"{JOB_TTL} seconds"
+        raise HTTPException(404, f"Unknown or expired job_id. Results are kept "
+                                 f"for {held} after a batch finishes.")
     # A job id is guessable in principle, and results contain candidate names
     # and CV-derived features. Only hand a job back to the user who created it.
     owner = job.get("uid") or ""

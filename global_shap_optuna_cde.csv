@@ -1,0 +1,45 @@
+set,feature,label,importance
+E,_embedding_E,Job market paper content,0.03381502508409737
+C,number of published papers,Number of published papers,0.028291294313906385
+C,number of awards,Number of awards,0.023520583443195173
+C,PrimaryResearchArea_financial,Primary area: Financial,0.01858547310498463
+D,number of top published papers,Top-journal publications,0.0118241491509575
+D,number of presentations on top conferences,Top-conference presentations,0.01164881502343442
+C,number of R&R papers,Number of R&R papers,0.011582535717627213
+D,number of top R&R papers,Top-journal R&Rs,0.0110358462229071
+D,number_of_coauthor_2degree,2nd-degree coauthor network size,0.011024103597770028
+D,PhD_top,PhD from a top-50 school,0.010083029827482642
+C,number of coauthors,Number of coauthors,0.010076733444219152
+C,number of reviewers,Reviewer roles,0.008994864039275026
+D,reference_mean,Average reference rank,0.008760495498491677
+D,reference_first,First reference rank,0.008699639837903526
+D,reference_high,Best reference rank,0.008611512701591615
+C,number of teaching experiences,Teaching experiences,0.007482706424884473
+D,coauthor_high,Best coauthor rank,0.0072737864115950505
+C,number of working experiences,Work experiences,0.006409076974556875
+C,number of membership,Professional memberships,0.006105816443703519
+D,coauthor_mean,Average coauthor rank,0.005560417579071487
+C,had academic work,Prior academic work,0.004780073779451824
+C,had non-academic work,Prior non-academic work,0.00474494804010904
+C,number of presentations,Number of presentations,0.003695440843727117
+C,has Master honor,Master's honors,0.002661687741565289
+D,Master_top,Master from a top-50 school,0.002377746209390518
+C,has Bachelor honor,Bachelor's honors,0.0023334822571678035
+C,number of papers in progress,Papers in progress,0.0019017704991344693
+C,provide abstract,Provides paper abstracts in CV,0.0017148415149077275
+C,PrimaryResearchArea_auditing,Primary area: Auditing,0.0016004824099333148
+C,gender,Gender (male),0.0015118753577672993
+C,has_reference,Has reference(s),0.0014744978244946255
+C,PrimaryResearchMethod_archival,Primary method: Archival,0.0013031590136340354
+C,multi_language,Speaks multiple languages,0.0010109043687121122
+D,Bachelor_top,Bachelor from a top-50 school,0.0009718746637854236
+D,second_language_euro,Second language (European),0.000822894983533661
+C,PrimaryResearchMethod_experiment,Primary method: Experimental,0.0007701614798835424
+D,coauthor_top,Has a top-1% coauthor,0.0005745545214551407
+C,has PhD honor,PhD honors,8.011368649842629e-05
+D,visit_top,Visited a top-50 school,0.0
+C,PrimaryResearchMethod_analytical,Primary method: Analytical,0.0
+C,PrimaryResearchArea_managerial,Primary area: Managerial,0.0
+C,has_coauthor,Has coauthor(s),0.0
+D,second_language_asia,Second language (Asian),0.0
+C,PrimaryResearchArea_tax,Primary area: Tax,0.0
