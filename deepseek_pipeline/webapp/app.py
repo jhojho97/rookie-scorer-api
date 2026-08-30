@@ -37,6 +37,7 @@ from pathlib import Path
 from fastapi import (FastAPI, UploadFile, File, Form, HTTPException,
                      BackgroundTasks, Depends, Header)
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
 HERE = Path(__file__).resolve().parent
 sys.path.append(str(HERE))
@@ -67,6 +68,22 @@ MAX_BATCH = int(os.environ.get("ROOKIE_MAX_BATCH", "20"))
 # one candidate because the only memory-heavy step (TreeSHAP) is serialised
 # behind a lock inside CandidateScorer.score -- important on Render's 512MB tier.
 BATCH_WORKERS = max(1, int(os.environ.get("ROOKIE_BATCH_WORKERS", "4")))
+
+# Ceiling on scorings running at once ACROSS ALL jobs and users. BATCH_WORKERS
+# only bounds one job, so N simultaneous batches previously put 4N scorings on a
+# shared-CPU instance at once. Measured effect: with five batches in flight,
+# /health took 63-125s to answer -- the event loop was starved by CPU-bound
+# model work holding the GIL. Everything queues here instead, so a busy server
+# stays responsive and users wait in line rather than all crawling together.
+MAX_CONCURRENT_SCORINGS = max(1, int(
+    os.environ.get("ROOKIE_MAX_CONCURRENT_SCORINGS", str(BATCH_WORKERS))))
+_SCORE_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_SCORINGS)
+
+
+def score_one(cv_text: str, jmp_text: str, top_n: int):
+    """Every scoring in the process goes through here, so the cap is global."""
+    with _SCORE_SLOTS:
+        return SCORER.score(cv_text, jmp_text, top_n=top_n)
 
 # --- Auth + CORS -------------------------------------------------------------
 # Scoring endpoints require a shared token in the  X-API-Key  header. Set
@@ -329,6 +346,7 @@ def health():
             "fetch_2degree": FETCH_2DEG,
             "max_batch": MAX_BATCH,
             "batch_workers": BATCH_WORKERS,
+            "max_concurrent_scorings": MAX_CONCURRENT_SCORINGS,
             "user_monthly_usd": USER_MONTHLY_USD,
             "user_hourly_scores": USER_HOURLY_SCORES,
             "usage_store": getattr(USAGE, "name", "memory"),
@@ -380,7 +398,11 @@ async def predict(cv: UploadFile = File(...),
         if not cv_text.strip():
             raise HTTPException(422, "Could not extract text from the CV file.")
         jmp_text = _read_jmp(jmp.filename, await jmp.read()) if jmp else ""
-        result = SCORER.score(cv_text, jmp_text, top_n=top_n)
+        # run_in_threadpool, NOT a direct call: this handler is async, so a
+        # synchronous scoring here blocks the event loop for its whole ~35s and
+        # stalls every other request in the process -- health checks and other
+        # users' job polling included.
+        result = await run_in_threadpool(score_one, cv_text, jmp_text, top_n)
         record_spend(uid, (result.get("cost") or {}).get("usd", 0.0))
         return result
     except HTTPException:
@@ -412,7 +434,7 @@ def _score_job(job_id: str, candidates: list[dict], top_n: int, uid: str = ""):
         def run(i: int) -> None:
             c = candidates[i]
             try:
-                res = SCORER.score(c["cv_text"], c["jmp_text"], top_n=top_n)
+                res = score_one(c["cv_text"], c["jmp_text"], top_n)
                 res["candidate"] = c["name"]
             except Exception as e:
                 res = {"candidate": c["name"], "status": "error", "reason": str(e)}
