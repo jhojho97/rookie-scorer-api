@@ -343,6 +343,8 @@ def health():
     sweep_jobs()
     return {"status": "ok", "target": TARGET,
             "model_ready": SCORER is not None,
+            # Which tuned models are live: "optuna" or "grid" (ROOKIE_MODEL).
+            "model": getattr(getattr(SCORER, "explainer", None), "model_name", None),
             "fetch_2degree": FETCH_2DEG,
             "max_batch": MAX_BATCH,
             "batch_workers": BATCH_WORKERS,

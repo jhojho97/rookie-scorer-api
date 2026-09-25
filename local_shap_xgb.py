@@ -136,7 +136,10 @@ SET_SLICES = {
     "D": ("Bachelor_top", "second_language_euro"),
     "E": ("0_dt", "255_dt"),
 }
-EMBEDDING_LABEL = "Job market paper content"   # collapsed Set E
+EMBEDDING_LABEL = "Job market paper content"
+
+# Tuned model sets the explainer can serve, by ROOKIE_MODEL value.
+MODEL_DIRS = {"optuna": "shap_models_optuna", "grid": "shap_models"}   # collapsed Set E
 
 
 def _fmt_value(feature: str, value):
@@ -154,15 +157,23 @@ class LocalExplainer:
     """
 
     def __init__(self, data_csv, target="pub_w_top_5pct",
-                 sets=("C", "D", "E"), train_test_year=2):
+                 sets=("C", "D", "E"), train_test_year=2, model=None):
         self.target = target
         self.sets = tuple(sets)
+        # Which tuned models to serve. "optuna" (default) loads the Optuna/AUPRC
+        # models built by training/train_optuna_models.py; "grid" loads the
+        # original grid-search models. Set ROOKIE_MODEL=grid to roll back.
+        self.model_name = (model or os.environ.get("ROOKIE_MODEL", "optuna")).strip().lower()
+        if self.model_name not in MODEL_DIRS:
+            raise ValueError(f"ROOKIE_MODEL must be one of {sorted(MODEL_DIRS)}, got {self.model_name!r}")
+        self.model_dir = MODEL_DIRS[self.model_name]
         self.models = {}        # set_label -> fitted model
         self.backgrounds = {}   # set_label -> training matrix (DataFrame)
         self.feature_names = {} # set_label -> [col names]
         self.explainers = {}    # set_label -> shap.TreeExplainer
 
-        print(f"Building local explainer for target='{target}', sets={self.sets} ...")
+        print(f"Building local explainer for target='{target}', sets={self.sets}, "
+              f"model={self.model_name} ({self.model_dir}/) ...")
         data = pd.read_csv(data_csv, index_col=0)
         feature_matrices, y_train, _, treatment_train, _, _ = prepare_data(
             data, train_test_year=train_test_year
@@ -177,10 +188,19 @@ class LocalExplainer:
         bg_n = int(os.environ.get("ROOKIE_SHAP_BG", "40"))
         for s in self.sets:
             X_train_full, _ = feature_matrices[s]
-            # Reuse cached model if shap_xgb.py already trained it (same key)
+            # retrain_best_xgb loads the cached pickle when it exists and
+            # otherwise TRAINS A GRID-SEARCH MODEL in its place. For the Optuna
+            # models that fallback would silently serve the wrong model, so a
+            # missing file is an error, not a retrain.
+            label = X_train_full.columns[0].split("_")[-1]
+            path = os.path.join(self.model_dir, f"xgb_{label}_{s}_{target}.pkl")
+            if self.model_name != "grid" and not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"{path} is missing. Build it with "
+                    f"`python training/train_optuna_models.py`, or set ROOKIE_MODEL=grid.")
             model, X_bg, _ = retrain_best_xgb(
                 X_train_full, y_train[target], treatment_train,
-                target=f"{s}_{target}",
+                target=f"{s}_{target}", cache_dir=self.model_dir,
             )
             if len(X_bg) > bg_n:
                 X_bg = X_bg.sample(n=bg_n, random_state=42)
