@@ -219,7 +219,7 @@ class LocalExplainer:
 
     # ── Reference cohort for percentile ranking ──────────────────────────────
     def _build_reference(self, feature_matrices):
-        """Score distribution used to turn one candidate's raw score into a rank.
+        """Score distributions used to turn one candidate's raw score into a rank.
 
         Built from the HELD-OUT split, not the whole dataset. The training rows
         are partly memorised, and since ~95% of them are negatives that
@@ -228,26 +228,45 @@ class LocalExplainer:
         candidate against that deflated distribution would overstate their
         percentile by up to ~12 points mid-range. Every real user is a candidate
         the model has never seen, so the held-out rows are the honest comparison.
+
+        One reference per combination of models a candidate can be scored
+        with: all sets, and all sets except the paper (E) for a candidate
+        with no readable job-market paper. A score is only ever ranked against
+        the same 131 candidates scored the SAME way, so a CV-only candidate is
+        compared on CV evidence alone rather than on an invented empty paper.
         """
         try:
-            probs = []
-            for s in self.sets:
-                X_test = feature_matrices[s][1]
-                probs.append(self.models[s].predict_proba(X_test.values)[:, 1])
-            ref = np.sort(np.mean(probs, axis=0))
-            print(f"  Reference cohort: {len(ref)} held-out candidates "
-                  f"(median score {np.median(ref) * 100:.1f}).")
-            return ref
+            probs = {s: self.models[s].predict_proba(feature_matrices[s][1].values)[:, 1]
+                     for s in self.sets}
+            combos = [self.sets]
+            if "E" in self.sets and len(self.sets) > 1:
+                combos.append(tuple(s for s in self.sets if s != "E"))
+            self.references = {
+                combo: np.sort(np.mean([probs[s] for s in combo], axis=0)) for combo in combos
+            }
+            for combo, ref in self.references.items():
+                print(f"  Reference cohort [{'+'.join(combo)}]: {len(ref)} held-out candidates "
+                      f"(median score {np.median(ref) * 100:.1f}).")
+            return self.references[self.sets]
         except Exception as e:
             print(f"  WARNING: no reference cohort ({e}); percentile unavailable.")
+            self.references = {}
             return None
 
-    def percentile_of(self, prediction):
+    def percentile_of(self, prediction, sets_used=None):
         """This score's rank within the reference cohort, 0-100, or None.
+
+        `sets_used` picks the reference scored the same way as the candidate;
+        omitted, it is the full-ensemble reference. There is deliberately no
+        fallback to a different reference: ranking a two-model average against
+        three-model averages is exactly the mismatch this exists to prevent.
 
         Midpoint rule for ties, so identical scores share one rank rather than
         the first arbitrarily beating the second."""
-        ref = self.reference
+        if sets_used is None:
+            ref = self.reference
+        else:
+            ref = getattr(self, "references", {}).get(tuple(s for s in self.sets if s in sets_used))
         if ref is None or len(ref) == 0:
             return None
         below = int(np.searchsorted(ref, prediction, side="left"))
@@ -322,6 +341,10 @@ class LocalExplainer:
             raise ValueError("No usable feature sets for this candidate "
                              f"(skipped: {skipped}). Check the input columns.")
 
+        sets_used = [s for s in self.sets if s not in skipped]
+        _ref = getattr(self, "references", {}).get(tuple(sets_used))
+        cohort_n = int(len(_ref)) if _ref is not None else 0
+
         # Ensemble = average of per-set probabilities; scale contributions by 1/n
         n_used = len(set_probs)
         prediction = float(np.mean(set_probs))
@@ -344,9 +367,9 @@ class LocalExplainer:
             # means little on its own -- a median candidate scores ~0.18 and
             # reads as a failure on any 0-100 dial. The ordering is what the
             # model is good at, and a percentile shows exactly that.
-            "percentile": self.percentile_of(prediction),
-            "cohort_n": int(len(self.reference)) if self.reference is not None else 0,
-            "sets_used": [s for s in self.sets if s not in skipped],
+            "percentile": self.percentile_of(prediction, sets_used),
+            "cohort_n": cohort_n,
+            "sets_used": sets_used,
             "sets_skipped": skipped,
             # Each set's OWN probability, before they are averaged into the
             # ensemble. How far apart these three are is a cheap, honest measure

@@ -127,12 +127,22 @@ class CandidateScorer:
             byu_row=byu_row,          # None=live scrape; dict=copy from dataset
         )
 
-        # 4. Set E (JMP embedding, paper's method; zero vector if no JMP)
-        if jmp_text.strip():
+        # 4. Set E (JMP embedding, paper's method).
+        #
+        # With no readable paper, Set E is left EMPTY (NaN) so the explainer
+        # scores this candidate with the CV models alone and ranks them against
+        # the held-out cohort scored the same way. It used to be a zero vector,
+        # which Model E had learned to rate highly: only 22 training candidates
+        # had no paper and one of them was a top researcher, and class weighting
+        # (~20:1) made that one person count as much as the other 21. An empty
+        # paper then outscored ~97% of real papers, so leaving the paper out
+        # raised a candidate's score by a median of ~29-35 points.
+        paper_used = bool(jmp_text.strip())
+        if paper_used:
             vec = embed_jmp_texts([jmp_text], meter=meter)[0]
+            set_e = {f"{i}_dt": float(vec[i]) for i in range(256)}
         else:
-            vec = np.zeros(256, dtype=float)
-        set_e = {f"{i}_dt": float(vec[i]) for i in range(256)}
+            set_e = {f"{i}_dt": float("nan") for i in range(256)}
 
         # 5. Assemble the model input row and explain
         row = {**set_c, **set_d, **set_e}
@@ -150,6 +160,9 @@ class CandidateScorer:
         # normal score. The caller has to be told, or it will present a number
         # derived from a blank row as though it meant something.
         result["extraction_ok"] = bool(rec.get("cv_extraction_ok", True))
+        # False when no readable paper was given: the score then rests on the
+        # CV and external metrics only (see step 4).
+        result["paper_used"] = paper_used
         result["extraction_problems"] = list(rec.get("extraction_problems") or [])
 
         # attach a little context for the UI

@@ -345,6 +345,9 @@ def health():
             "model_ready": SCORER is not None,
             # Which tuned models are live: "optuna" or "grid" (ROOKIE_MODEL).
             "model": getattr(getattr(SCORER, "explainer", None), "model_name", None),
+            # Ranking references loaded, e.g. ["C+D+E", "C+D"]; "C+D" is the one
+            # a candidate with no readable paper is ranked against.
+            "references": ["+".join(k) for k in getattr(getattr(SCORER, "explainer", None), "references", {}) or {}],
             "fetch_2degree": FETCH_2DEG,
             "max_batch": MAX_BATCH,
             "batch_workers": BATCH_WORKERS,
