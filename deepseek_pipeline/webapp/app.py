@@ -348,6 +348,12 @@ def health():
             # Ranking references loaded, e.g. ["C+D+E", "C+D"]; "C+D" is the one
             # a candidate with no readable paper is ranked against.
             "references": ["+".join(k) for k in getattr(getattr(SCORER, "explainer", None), "references", {}) or {}],
+            # Every target served, each with its ranking references.
+            "targets": {t: ["+".join(k) for k in (getattr(ex, "references", {}) or {})]
+                        for t, ex in (getattr(SCORER, "explainers", {}) or {}).items()},
+            # Model family serving each target ("optuna" or "grid").
+            "target_models": {t: getattr(ex, "model_name", None)
+                              for t, ex in (getattr(SCORER, "explainers", {}) or {}).items()},
             "fetch_2degree": FETCH_2DEG,
             "max_batch": MAX_BATCH,
             "batch_workers": BATCH_WORKERS,

@@ -38,6 +38,16 @@ import build_set_D as D
 from build_set_E import embed as embed_jmp_texts
 from build_scibert_dataset import extract_jmp_sections
 from local_shap_xgb import LocalExplainer
+from shap_xgb import prepare_data
+import pandas as pd
+
+# Every research-productivity target served, in display order. The first is
+# the default unless the scorer is given another.
+DEFAULT_TARGETS = ("pub_w_top_5pct", "pub_w_top_10pct", "pub_w_top_20pct", "pub_w_top_30pct")
+# The part of an explanation that depends on the target; everything else in a
+# result (extraction, cost, paper_used, ...) is shared.
+TARGET_FIELDS = ("target", "prediction", "baseline", "percentile", "cohort_n",
+                 "sets_used", "sets_skipped", "set_predictions", "top_factors")
 from pricing import UsageMeter
 
 
@@ -46,7 +56,15 @@ class CandidateScorer:
 
     def __init__(self, data_csv, target="pub_w_top_5pct",
                  sets=("C", "D", "E"), byu_year=None, fetch_2degree=False,
-                 provider="deepseek"):
+                 provider="deepseek", targets=None):
+        # `target` is the default: its result fills the response's top-level
+        # fields, so clients that predate per-target results keep working.
+        # `targets` is every target scored; all of them come back under
+        # result["targets"]. Scoring them all costs ~7 ms each -- the extraction
+        # and embedding that dominate a scoring happen once, whatever the target.
+        if targets is None:
+            targets = [t.strip() for t in os.environ.get("ROOKIE_TARGETS", ",".join(DEFAULT_TARGETS)).split(",") if t.strip()]
+        self.targets = list(dict.fromkeys([target, *targets]))
         self.target = target
         self.fetch_2degree = fetch_2degree
         self.provider = provider
@@ -76,8 +94,13 @@ class CandidateScorer:
         self.byu = self._load_byu(byu_year)
 
         # 3. Model + SHAP explainer (loads cached C/D/E models from shap_models/)
-        print(f"[scorer] building explainer for target={target} ...")
-        self.explainer = LocalExplainer(data_csv, target=target, sets=sets)
+        # One dataset load shared by every target's explainer (~6 MB each after
+        # the first, measured), rather than one read of the CSV per target.
+        print(f"[scorer] building explainers for targets={self.targets} ...")
+        prepared = prepare_data(pd.read_csv(data_csv, index_col=0), train_test_year=2)
+        self.explainers = {t: LocalExplainer(data_csv, target=t, sets=sets, prepared=prepared)
+                           for t in self.targets}
+        self.explainer = self.explainers[target]   # the default target's
         # score() is called concurrently by batch workers. Everything before the
         # explain step is network-bound and thread-safe, but shap.TreeExplainer
         # is neither thread-safe nor cheap in memory (it materialises the
@@ -147,7 +170,12 @@ class CandidateScorer:
         # 5. Assemble the model input row and explain
         row = {**set_c, **set_d, **set_e}
         with self._explain_lock:
-            result = self.explainer.explain(row, top_n=top_n)
+            per_target = {t: ex.explain(row, top_n=top_n) for t, ex in self.explainers.items()}
+        # Top level = the default target, exactly as before; every target's
+        # result (default included) under "targets".
+        result = dict(per_target[self.target])
+        result["targets"] = {t: {k: r[k] for k in TARGET_FIELDS if k in r}
+                             for t, r in per_target.items()}
 
         # When this scoring actually happened. The client cannot derive it: a
         # report is re-rendered, reopened from a table and exported to PDF long

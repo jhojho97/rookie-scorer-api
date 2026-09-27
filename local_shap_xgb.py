@@ -141,6 +141,21 @@ EMBEDDING_LABEL = "Job market paper content"
 # Tuned model sets the explainer can serve, by ROOKIE_MODEL value.
 MODEL_DIRS = {"optuna": "shap_models_optuna", "grid": "shap_models"}   # collapsed Set E
 
+# Targets served by a different model family than ROOKIE_MODEL. Chosen on the
+# 2018 hold-out with the paper's metrics through the live pipeline: at the top
+# 10% the grid-search models found 7 of 13 top researchers against Optuna's 5-6.
+# Override with ROOKIE_MODEL_BY_TARGET="pub_w_top_10pct=grid,pub_w_top_20pct=optuna".
+MODEL_BY_TARGET = {"pub_w_top_10pct": "grid"}
+
+
+def model_for_target(target, default):
+    """The model family ("optuna"/"grid") that serves `target`."""
+    env = os.environ.get("ROOKIE_MODEL_BY_TARGET")
+    choice = dict(MODEL_BY_TARGET)
+    if env is not None:
+        choice = dict(kv.split("=", 1) for kv in env.replace(" ", "").split(",") if "=" in kv)
+    return choice.get(target, default).strip().lower()
+
 
 def _fmt_value(feature: str, value):
     """Format a raw feature value for display."""
@@ -157,13 +172,16 @@ class LocalExplainer:
     """
 
     def __init__(self, data_csv, target="pub_w_top_5pct",
-                 sets=("C", "D", "E"), train_test_year=2, model=None):
+                 sets=("C", "D", "E"), train_test_year=2, model=None, prepared=None):
         self.target = target
         self.sets = tuple(sets)
         # Which tuned models to serve. "optuna" (default) loads the Optuna/AUPRC
         # models built by training/train_optuna_models.py; "grid" loads the
         # original grid-search models. Set ROOKIE_MODEL=grid to roll back.
-        self.model_name = (model or os.environ.get("ROOKIE_MODEL", "optuna")).strip().lower()
+        # An explicit `model` wins; otherwise MODEL_BY_TARGET can send a
+        # target to the other family.
+        self.model_name = (model or model_for_target(
+            target, os.environ.get("ROOKIE_MODEL", "optuna"))).strip().lower()
         if self.model_name not in MODEL_DIRS:
             raise ValueError(f"ROOKIE_MODEL must be one of {sorted(MODEL_DIRS)}, got {self.model_name!r}")
         self.model_dir = MODEL_DIRS[self.model_name]
@@ -174,10 +192,15 @@ class LocalExplainer:
 
         print(f"Building local explainer for target='{target}', sets={self.sets}, "
               f"model={self.model_name} ({self.model_dir}/) ...")
-        data = pd.read_csv(data_csv, index_col=0)
-        feature_matrices, y_train, _, treatment_train, _, _ = prepare_data(
-            data, train_test_year=train_test_year
-        )
+        # `prepared` lets several targets share ONE loaded copy of the dataset
+        # (see CandidateScorer). Labels come from the full training table:
+        # prepare_data's y_train only carries the two 5% columns.
+        if prepared is None:
+            prepared = prepare_data(pd.read_csv(data_csv, index_col=0),
+                                    train_test_year=train_test_year)
+        feature_matrices, _, _, treatment_train, train_df, _ = prepared
+        if target not in train_df.columns:
+            raise ValueError(f"Unknown target {target!r}: no such label column in the dataset.")
 
         # Interventional probability SHAP integrates over the background, so its
         # memory/compute scale with the background size (heaviest for the 256-dim
@@ -189,24 +212,29 @@ class LocalExplainer:
         for s in self.sets:
             X_train_full, _ = feature_matrices[s]
             # retrain_best_xgb loads the cached pickle when it exists and
-            # otherwise TRAINS A GRID-SEARCH MODEL in its place. For the Optuna
-            # models that fallback would silently serve the wrong model, so a
-            # missing file is an error, not a retrain.
+            # otherwise TRAINS A GRID-SEARCH MODEL in its place. At startup on a
+            # small server that is slow, memory-hungry and lost on restart, and
+            # for the Optuna set it would silently serve the wrong model. So a
+            # missing file is an error in every mode, never a retrain.
             label = X_train_full.columns[0].split("_")[-1]
             path = os.path.join(self.model_dir, f"xgb_{label}_{s}_{target}.pkl")
-            if self.model_name != "grid" and not os.path.exists(path):
+            if not os.path.exists(path):
                 raise FileNotFoundError(
-                    f"{path} is missing. Build it with "
-                    f"`python training/train_optuna_models.py`, or set ROOKIE_MODEL=grid.")
+                    f"{path} is missing. Build it offline (training/train_optuna_models.py "
+                    f"for Optuna) and commit it; the server never trains models itself.")
             model, X_bg, _ = retrain_best_xgb(
-                X_train_full, y_train[target], treatment_train,
+                X_train_full, train_df[target], treatment_train,
                 target=f"{s}_{target}", cache_dir=self.model_dir,
             )
             if len(X_bg) > bg_n:
                 X_bg = X_bg.sample(n=bg_n, random_state=42)
             self.models[s] = model
             self.backgrounds[s] = X_bg
-            self.feature_names[s] = list(X_train_full.columns)
+            # The pickle's own background matrix holds the columns the model was
+            # trained on. Read them from there so a model trained with a
+            # feature dropped (number_of_coauthor_2degree, which the live
+            # pipeline cannot build) is served with exactly its own columns.
+            self.feature_names[s] = list(X_bg.columns)
             # Probability-space interventional TreeExplainer (matches shap_xgb.py)
             self.explainers[s] = shap.TreeExplainer(
                 model,
@@ -236,7 +264,7 @@ class LocalExplainer:
         compared on CV evidence alone rather than on an invented empty paper.
         """
         try:
-            probs = {s: self.models[s].predict_proba(feature_matrices[s][1].values)[:, 1]
+            probs = {s: self.models[s].predict_proba(feature_matrices[s][1][self.feature_names[s]].values)[:, 1]
                      for s in self.sets}
             combos = [self.sets]
             if "E" in self.sets and len(self.sets) > 1:
