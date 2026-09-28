@@ -141,11 +141,12 @@ EMBEDDING_LABEL = "Job market paper content"
 # Tuned model sets the explainer can serve, by ROOKIE_MODEL value.
 MODEL_DIRS = {"optuna": "shap_models_optuna", "grid": "shap_models"}   # collapsed Set E
 
-# Targets served by a different model family than ROOKIE_MODEL. Chosen on the
-# 2018 hold-out with the paper's metrics through the live pipeline: at the top
-# 10% the grid-search models found 7 of 13 top researchers against Optuna's 5-6.
-# Override with ROOKIE_MODEL_BY_TARGET="pub_w_top_10pct=grid,pub_w_top_20pct=optuna".
-MODEL_BY_TARGET = {"pub_w_top_10pct": "grid"}
+# Targets served by a different model family than ROOKIE_MODEL. Empty since
+# 28 Sep 2026: every target is on Optuna (user decision). Top 10% was on grid
+# 27-28 Sep; on the 2018 hold-out, live, grid found 7 of 13 top researchers
+# and Optuna 5.
+# Override with ROOKIE_MODEL_BY_TARGET="pub_w_top_10pct=grid".
+MODEL_BY_TARGET = {}
 
 
 def model_for_target(target, default):
